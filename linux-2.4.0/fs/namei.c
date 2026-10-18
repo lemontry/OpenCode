@@ -166,36 +166,69 @@ char * getname(const char * filename)
  * for filesystem access without changing the "normal" uids which
  * are used for other things..
  */
+/**
+ * vfs_permission - VFS 默认权限校验实现（Linux2.4）
+ * @inode: 待检查文件的inode
+ * @mask: 需要检查的权限掩码（MAY_READ/MAY_WRITE/MAY_EXEC，底层映射为 S_IRUSR/S_IWUSR/S_IXUSR 这类）
+ *
+ * 上层permission()函数在文件系统没有自定义i_op->permission时，调用此默认函数。
+ * 实现标准UNIX rwx权限检查，同时处理只读文件系统、不可变属性、root能力(capabilities)。
+ */
 int vfs_permission(struct inode * inode,int mask)
 {
 	int mode = inode->i_mode;
 
+	//复用 #define MAY_WRITE 2， 这个代码怪模怪样
+	// 1. 写权限检查：如果请求写 && 文件系统只读，且是普通文件/目录/软链接 → 返回只读错误
 	if ((mask & S_IWOTH) && IS_RDONLY(inode) &&
 		 (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
 		return -EROFS; /* Nobody gets write access to a read-only fs */
 
+	// 2. 文件设置了IMMUTABLE(不可变)属性，任何人都不能写
 	if ((mask & S_IWOTH) && IS_IMMUTABLE(inode))
 		return -EACCES; /* Nobody gets write access to an immutable file */
 
+	// 3. 权限位移位：判断当前进程fsuid是文件属主，就右移6bit（取出owner rwx）
+	//    如果属于文件所属用户组，右移3bit（取出group rwx）
+	//    否则不动，直接看other位
 	if (current->fsuid == inode->i_uid)
-		mode >>= 6;
+		mode >>= 6;  //用户权限
 	else if (in_group_p(inode->i_gid))
-		mode >>= 3;
+		mode >>= 3;  //组权限
 
+	// 4. 检查：权限位满足要求，或者拥有 CAP_DAC_OVERRIDE 能力（绕过DAC权限检查）
+	//    CAP_DAC_OVERRIDE：root常用能力，可以无视rwx读写执行权限
 	if (((mode & mask & S_IRWXO) == mask) || capable(CAP_DAC_OVERRIDE))
 		return 0;
 
 	/* read and search access */
+	// 5. 特殊能力 CAP_DAC_READ_SEARCH：仅允许绕过【读】和【目录检索】权限
+	//    不能用来写文件。
+	// #define MAY_READ 4
 	if ((mask == S_IROTH) ||
 	    (S_ISDIR(inode->i_mode)  && !(mask & ~(S_IROTH | S_IXOTH))))
 		if (capable(CAP_DAC_READ_SEARCH))
 			return 0;
 
+	// 全部校验失败：权限拒绝
 	return -EACCES;
 }
 
+/**
+ * permission - VFS权限检查入口函数（Linux 2.4内核）
+ * @inode: 待校验的文件对应的inode对象
+ * @mask: 要检查的权限掩码：MAY_READ / MAY_WRITE / MAY_EXEC
+ *
+ * 调用路径：path_walk -> permission，open_namei也会调用它
+ * 作用：判断当前进程是否拥有对该inode的读/写/执行权限
+ * 逻辑：优先使用文件系统自定义的permission回调；没有自定义回调，走通用vfs_permission
+ * #define MAY_EXEC 1
+ * #define MAY_WRITE 2
+ * #define MAY_READ 4
+ */
 int permission(struct inode * inode,int mask)
 {
+	// 如果inode的i_op存在，并且i_op提供了permission回调函数
 	if (inode->i_op && inode->i_op->permission) {
 		int retval;
 		lock_kernel();
@@ -203,6 +236,7 @@ int permission(struct inode * inode,int mask)
 		unlock_kernel();
 		return retval;
 	}
+	// 文件系统没有实现自定义permission方法，使用VFS默认权限检查函数
 	return vfs_permission(inode, mask);
 }
 

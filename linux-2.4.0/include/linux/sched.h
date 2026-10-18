@@ -110,6 +110,55 @@ extern int last_pid;
 /*
  * Scheduling policies
  */
+
+ /*
+ ## 1. SCHED_OTHER（普通分时进程，默认策略）
+
+全称：SCHED_OTHER，**普通分时调度（非实时）**
+
+- 适用：绝大多数用户进程，bash、gcc、应用程序默认都是这个
+- 优先级：由 `nice` 值决定（nice 范围 -20 ~ +19），换算成初始时间片 `counter`
+- 规则：
+  1. 用`counter`作为剩余时间片，时钟中断里不断减`counter`；counter=0，时间片耗尽。
+  2. `goodness()`打分，counter 越大分数越高，优先被选中运行。
+  3. 所有就绪进程 counter 全部耗尽 → 触发`recalculate`，**全局遍历所有任务重新计算 counter**。
+  4. 不支持抢占：同是 SCHED_OTHER，高 nice 只是时间片更长；一个 SCHED_OTHER 进程正在运行，另一个 SCHED_OTHER 就绪，不会主动抢占，等时间片用完或主动 sleep。
+
+> 
+> 注意：**SCHED_OTHER 没有实时优先级（rt_priority）**
+
+## 2. SCHED_FIFO 实时策略（先进先出）
+
+全称：SCHED_FIFO = First In First Out，**实时 FIFO**
+
+- 属于**实时进程**，优先级 `rt_priority`（1~99，数字越大优先级越高）
+- 规则：
+  1. 只要 CPU 上有就绪的 FIFO 实时任务，**一定会优先于 SCHED_OTHER**运行。
+  2. 高 rt_priority 就绪任务一旦就绪，**立刻抢占低优先级任务**。
+  3. **没有时间片！** 一旦拿到 CPU 就一直跑，直到：
+     - 主动 sleep（等待信号 / IO），主动让出 CPU；
+     - 更高优先级实时任务就绪，被抢占。
+  4. 同优先级 SCHED_FIFO：先就绪先运行，不轮换；不自动让出 CPU。
+
+> 
+> 风险：如果一个 FIFO 死循环、不睡眠，同优先级 / 低优先级任务会永久饿死。
+
+## 3. SCHED_RR 实时策略（Round Robin 实时轮询）
+
+全称：SCHED_RR = Round-Robin，**实时轮询**
+
+- 同样是**实时进程**，`rt_priority`（1~99，越大优先级越高），优先级高于 SCHED_OTHER
+- 和 FIFO 几乎一样，唯一差别：**带时间片**
+
+1. 高优先级抢占低优先级；
+2. 同优先级 RR 任务：进程拿到 CPU，运行到**时间片耗尽**；
+3. 时间片用完：内核把它移动到就绪队列**同优先级组的队尾**（就是前面看到的`move_last_runqueue()`），调度同优先级下一个就绪 RR 任务；
+4. 如果进程主动 sleep，时间片不会被消耗。
+
+> 
+> 一句话区分 FIFO 与 RR：
+> 同优先级：FIFO 一旦上 CPU 就一直跑；RR 有时间片，时间片用完同优先级轮换。
+ */
 #define SCHED_OTHER		0
 #define SCHED_FIFO		1
 #define SCHED_RR		2
@@ -1054,6 +1103,7 @@ do {									\
 #define next_thread(p) \
 	list_entry((p)->thread_group.next, struct task_struct, thread_group)
 
+//从就绪队列中移除
 static inline void del_from_runqueue(struct task_struct * p)
 {
 	nr_running--;

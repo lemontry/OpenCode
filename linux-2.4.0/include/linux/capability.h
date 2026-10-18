@@ -76,7 +76,7 @@ typedef __u32 kernel_cap_t;
    [_POSIX_ACL] is defined. Excluding DAC access covered by
    CAP_LINUX_IMMUTABLE. */
 
-#define CAP_DAC_OVERRIDE     1
+#define cCAP_DAC_OVERRIDE     1
 
 /* Overrides all DAC restrictions regarding read and search on files
    and directories, including ACL restrictions if [_POSIX_ACL] is

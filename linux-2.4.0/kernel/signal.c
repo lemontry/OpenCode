@@ -648,24 +648,42 @@ printk(" %d -> %d\n", signal_pending(t), ret);
  * we unblock the signal and change any SIG_IGN to SIG_DFL.
  */
 
+/**
+ * force_sig_info - 强制向进程发送带详细信息的信号（不可被忽略/阻塞）
+ * @sig: 信号编号，如 SIGTRAP
+ * @info: siginfo_t 附加信号信息（故障地址、si_code等）
+ * @t: 目标进程 task_struct
+ * 返回值：0成功，负数错误码
+ */
 int
 force_sig_info(int sig, struct siginfo *info, struct task_struct *t)
 {
-	unsigned long int flags;
+    unsigned long int flags;
+    // 加锁，保存中断标志位，防止并发修改信号相关字段
+    spin_lock_irqsave(&t->sigmask_lock, flags);
 
-	spin_lock_irqsave(&t->sigmask_lock, flags);
-	if (t->sig == NULL) {
-		spin_unlock_irqrestore(&t->sigmask_lock, flags);
-		return -ESRCH;
-	}
+    // 检查进程信号描述符是否存在，进程已经消亡则返回ESRCH
+    if (t->sig == NULL) {
+        spin_unlock_irqrestore(&t->sigmask_lock, flags);
+        return -ESRCH;
+    }
 
-	if (t->sig->action[sig-1].sa.sa_handler == SIG_IGN)
-		t->sig->action[sig-1].sa.sa_handler = SIG_DFL;
-	sigdelset(&t->blocked, sig);
-	recalc_sigpending(t);
-	spin_unlock_irqrestore(&t->sigmask_lock, flags);
+    // 重点：force_sig_info 强制特性
+    // 如果进程对该信号设置为忽略SIG_IGN，强制改成默认处理SIG_DFL
+    if (t->sig->action[sig-1].sa.sa_handler == SIG_IGN)
+        t->sig->action[sig-1].sa.sa_handler = SIG_DFL;
 
-	return send_sig_info(sig, info, t);
+    // 从进程的阻塞信号位图中删除这个信号：强制取消阻塞，信号一定能送达
+    sigdelset(&t->blocked, sig);
+
+    // 重新计算 t->sigpending 标记：检查是否存在待处理信号，更新标志
+    recalc_sigpending(t);
+
+    // 解锁，恢复中断状态
+    spin_unlock_irqrestore(&t->sigmask_lock, flags);
+
+    // 调用底层函数，把siginfo和信号挂入进程的pending信号队列
+    return send_sig_info(sig, info, t);
 }
 
 /*

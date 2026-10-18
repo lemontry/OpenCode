@@ -12,25 +12,36 @@ struct task_struct;	/* one of the stranger aspects of C forward declarations.. *
 extern void FASTCALL(__switch_to(struct task_struct *prev, struct task_struct *next));
 
 #define prepare_to_switch()	do { } while(0)
-#define switch_to(prev,next,last) do {					\
-	asm volatile("pushl %%esi\n\t"					\
-		     "pushl %%edi\n\t"					\
-		     "pushl %%ebp\n\t"					\
-		     "movl %%esp,%0\n\t"	/* save ESP */		\
-		     "movl %3,%%esp\n\t"	/* restore ESP */	\
-		     "movl $1f,%1\n\t"		/* save EIP */		\
-		     "pushl %4\n\t"		/* restore EIP */	\
-		     "jmp __switch_to\n"				\
-		     "1:\t"						\
-		     "popl %%ebp\n\t"					\
-		     "popl %%edi\n\t"					\
-		     "popl %%esi\n\t"					\
-		     :"=m" (prev->thread.esp),"=m" (prev->thread.eip),	\
-		      "=b" (last)					\
-		     :"m" (next->thread.esp),"m" (next->thread.eip),	\
-		      "a" (prev), "d" (next),				\
-		      "b" (prev));					\
+
+/**
+ * #define switch_to(prev,next,last)
+ * @prev: 将要被换下的旧进程 task_struct*
+ * @next: 将要切换上CPU的新进程 task_struct*
+ * @last: 输出参数，保存上一次被切换出去的进程指针
+ * 功能：x86 32位 Linux2.4 底层进程上下文切换宏，内嵌汇编
+ * 作用：保存prev进程的硬件上下文(栈、寄存器)，加载next进程的上下文，实现进程切换
+ * 注意：这是**进程上下文切换核心**，在schedule()内部调用
+ */
+#define switch_to(prev,next,last) do {                      \
+    asm volatile("pushl %%esi\n\t"                          \
+                 "pushl %%edi\n\t"                          \
+                 "pushl %%ebp\n\t"                          \
+                 "movl %%esp,%0\n\t"    /* save ESP：把旧进程当前栈指针ESP，存入prev->thread.esp */\
+                 "movl %3,%%esp\n\t"    /* restore ESP：加载next->thread.esp到ESP，切换栈！*/\
+                 "movl $1f,%1\n\t"      /* save EIP：把标签1的地址保存到prev->thread.eip，作为旧进程下次恢复执行的返回地址 */\
+                 "pushl %4\n\t"         /* restore EIP：把next->thread.eip压栈，作为ret的返回地址 */\
+                 "jmp __switch_to\n"                        \
+                 "1:\t"                                     \
+                 "popl %%ebp\n\t"                           \
+                 "popl %%edi\n\t"                           \
+                 "popl %%esi\n\t"                           \
+                 :"=m" (prev->thread.esp),"=m" (prev->thread.eip),  \
+                  "=b" (last)                                 \
+                 :"m" (next->thread.esp),"m" (next->thread.eip),    \
+                  "a" (prev), "d" (next),                     \
+                  "b" (prev));                                 \
 } while (0)
+
 
 #define _set_base(addr,base) do { unsigned long __pr; \
 __asm__ __volatile__ ("movw %%dx,%1\n\t" \

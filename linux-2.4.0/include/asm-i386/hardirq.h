@@ -6,20 +6,34 @@
 #include <linux/irq.h>
 
 /* entry.S is sensitive to the offsets of these fields */
+/**
+ * irq_cpustat_t - 每CPU中断/软中断统计状态结构体（Linux2.4）
+ * ____cacheline_aligned：整个结构体对齐到cacheline边界，防止SMP伪共享
+ * 每个CPU有一份独立的irq_cpustat_t，保存该CPU的中断相关计数器
+ */
 typedef struct {
-	unsigned int __softirq_active;
-	unsigned int __softirq_mask;
-	unsigned int __local_irq_count;
-	unsigned int __local_bh_count;
-	unsigned int __syscall_count;
-	unsigned int __nmi_count;	/* arch dependent */
+	unsigned int __softirq_active;  // 已经触发、待处理的软中断位图（哪类softirq挂起了）
+	unsigned int __softirq_mask;    // 软中断屏蔽掩码：哪些软中断类型被禁止执行
+	unsigned int __local_irq_count; // 硬中断嵌套计数，in_irq()读取这个
+	unsigned int __local_bh_count;  // bottom half软中断执行计数，in_interrupt()会读取它
+	unsigned int __syscall_count;   // 系统调用计数（统计当前CPU发生系统调用的次数）
+	// NMI = Non-Maskable Interrupt
+	unsigned int __nmi_count;       // NMI中断计数，架构相关，统计不可屏蔽中断次数
 } ____cacheline_aligned irq_cpustat_t;
+
 
 #include <linux/irq_cpustat.h>	/* Standard mappings for irq_cpustat_t above */
 
 /*
  * Are we in an interrupt context? Either doing bottom half
  * or hardware interrupt processing?
+ */
+/**
+ * in_interrupt() - 判断当前CPU是否处于中断上下文（Linux 2.4）
+ * 返回真：处于硬中断 或 软中断（bottom half）上下文；返回假：进程上下文
+ *
+ * local_irq_count(__cpu)：硬中断计数；local_bh_count(__cpu)：软中断(bh)计数
+ * 只要任意一个不为0，就代表在中断上下文
  */
 #define in_interrupt() ({ int __cpu = smp_processor_id(); \
 	(local_irq_count(__cpu) + local_bh_count(__cpu) != 0); })

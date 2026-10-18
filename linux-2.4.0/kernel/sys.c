@@ -717,7 +717,7 @@ asmlinkage long sys_setfsuid(uid_t uid)
 }
 
 /*
- * Samma p� svenska..
+ * Samma p� svenska..
  */
 asmlinkage long sys_setfsgid(gid_t gid)
 {
@@ -939,6 +939,7 @@ static int supplemental_group_member(gid_t grp)
 /*
  * Check whether we're fsgid/egid or in the supplemental group..
  */
+//判断是组还是附属组
 int in_group_p(gid_t grp)
 {
 	int retval = 1;

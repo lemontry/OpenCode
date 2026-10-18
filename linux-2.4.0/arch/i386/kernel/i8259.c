@@ -95,25 +95,40 @@ BUILD_SMP_INTERRUPT(error_interrupt,ERROR_APIC_VECTOR)
 BUILD_SMP_INTERRUPT(spurious_interrupt,SPURIOUS_APIC_VECTOR)
 #endif
 
+/**
+ * IRQ(x,y)：宏，## 是C预处理器的**符号拼接运算符**
+ * IRQ##x##y##_interrupt 拼接成 IRQxy_interrupt
+ * 例：IRQ(0,0) → IRQ00_interrupt
+ */
 #define IRQ(x,y) \
-	IRQ##x##y##_interrupt
+    IRQ##x##y##_interrupt
 
+/**
+ * IRQLIST_16(x)：一次性展开16个IRQ符号，0~f（16个）
+ * 用于批量生成数组初始化列表，一行生成16个函数指针
+ */
 #define IRQLIST_16(x) \
-	IRQ(x,0), IRQ(x,1), IRQ(x,2), IRQ(x,3), \
-	IRQ(x,4), IRQ(x,5), IRQ(x,6), IRQ(x,7), \
-	IRQ(x,8), IRQ(x,9), IRQ(x,a), IRQ(x,b), \
-	IRQ(x,c), IRQ(x,d), IRQ(x,e), IRQ(x,f)
+    IRQ(x,0), IRQ(x,1), IRQ(x,2), IRQ(x,3), \
+    IRQ(x,4), IRQ(x,5), IRQ(x,6), IRQ(x,7), \
+    IRQ(x,8), IRQ(x,9), IRQ(x,a), IRQ(x,b), \
+    IRQ(x,c), IRQ(x,d), IRQ(x,e), IRQ(x,f)
 
+/**
+ * interrupt[]：全局函数指针数组
+ * 数组每个元素，存放对应IRQ的汇编stub入口地址
+ * NR_IRQS：最大IRQ数量
+ */
 void (*interrupt[NR_IRQS])(void) = {
-	IRQLIST_16(0x0),
-
+    IRQLIST_16(0x0),  // IRQ00_interrupt ~ IRQ0f_interrupt（16项）
 #ifdef CONFIG_X86_IO_APIC
-			 IRQLIST_16(0x1), IRQLIST_16(0x2), IRQLIST_16(0x3),
-	IRQLIST_16(0x4), IRQLIST_16(0x5), IRQLIST_16(0x6), IRQLIST_16(0x7),
-	IRQLIST_16(0x8), IRQLIST_16(0x9), IRQLIST_16(0xa), IRQLIST_16(0xb),
-	IRQLIST_16(0xc), IRQLIST_16(0xd)
+    // 如果开启IOAPIC，继续追加更多16个一组的IRQ入口
+    IRQLIST_16(0x1), IRQLIST_16(0x2), IRQLIST_16(0x3),
+    IRQLIST_16(0x4), IRQLIST_16(0x5), IRQLIST_16(0x6), IRQLIST_16(0x7),
+    IRQLIST_16(0x8), IRQLIST_16(0x9), IRQLIST_16(0xa), IRQLIST_16(0xb),
+    IRQLIST_16(0xc), IRQLIST_16(0xd)
 #endif
 };
+
 
 #undef IRQ
 #undef IRQLIST_16
@@ -435,11 +450,19 @@ void __init init_ISA_irqs (void)
 	}
 }
 
+/**
+ * void __init init_IRQ(void)
+ * Linux2.4 x86 硬件中断初始化函数
+ * __init：启动后该函数内存可以释放
+ * 调用位置：start_kernel() -> trap_init()之后执行init_IRQ()
+ * 功能：初始化ISA中断、批量填充IDT里外设硬件中断的中断门；注册SMP的IPI中断、本地APIC定时器中断；最后配置PIT8253时钟芯片
+ * 注意：trap_init 填充CPU异常、int0x80；init_IRQ填充**外设硬件中断**向量
+ */
 void __init init_IRQ(void)
 {
 	int i;
-
 #ifndef CONFIG_X86_VISWS_APIC
+	// 初始化传统ISA中断（8259A主从两片PIC）
 	init_ISA_irqs();
 #else
 	init_VISWS_APIC_irqs();
@@ -449,10 +472,23 @@ void __init init_IRQ(void)
 	 * us. (some of these will be overridden and become
 	 * 'special' SMP interrupts)
 	 */
+	// 循环批量设置所有外部IRQ对应的IDT中断门描述符
+	/**
+	 * 其实就是如下代码：
+	 * #define BUILD_IRQ(nr) \
+		asmlinkage void IRQ_NAME(nr); \
+		__asm__( \
+		"\n"__ALIGN_STR"\n" \
+		SYMBOL_NAME_STR(IRQ) #nr "_interrupt:\n\t" \
+			"pushl $"#nr"-256\n\t" \
+			"jmp common_interrupt");
+	 */
 	for (i = 0; i < NR_IRQS; i++) {
+		// FIRST_EXTERNAL_VECTOR：外部硬件中断起始向量号
 		int vector = FIRST_EXTERNAL_VECTOR + i;
-		if (vector != SYSCALL_VECTOR) 
-			set_intr_gate(vector, interrupt[i]);
+		if (vector != SYSCALL_VECTOR) // 避开0x80系统调用向量，不要覆盖
+			// set_intr_gate：中断门，进入中断处理自动关闭IF硬件中断
+			set_intr_gate(vector, interrupt[i]);  //common_interrupt  --> do_IRQ (irq.c)
 	}
 
 #ifdef CONFIG_SMP
@@ -460,26 +496,25 @@ void __init init_IRQ(void)
 	 * IRQ0 must be given a fixed assignment and initialized,
 	 * because it's used before the IO-APIC is set up.
 	 */
+	// SMP：IRQ0(PIT时钟中断)固定向量，IOAPIC初始化前就要能用
 	set_intr_gate(FIRST_DEVICE_VECTOR, interrupt[0]);
 
 	/*
 	 * The reschedule interrupt is a CPU-to-CPU reschedule-helper
 	 * IPI, driven by wakeup.
 	 */
+	// SMP跨CPU IPI：RESCHEDULE_VECTOR 调度中断，smp_send_reschedule发送这个IPI
 	set_intr_gate(RESCHEDULE_VECTOR, reschedule_interrupt);
-
-	/* IPI for invalidation */
+	// IPI：TLB失效中断，远程刷新其他CPU页表缓存
 	set_intr_gate(INVALIDATE_TLB_VECTOR, invalidate_interrupt);
-
-	/* IPI for generic function call */
+	// IPI：函数调用IPI，让别的CPU执行指定函数
 	set_intr_gate(CALL_FUNCTION_VECTOR, call_function_interrupt);
-#endif	
+#endif
 
 #ifdef CONFIG_X86_LOCAL_APIC
-	/* self generated IPI for local APIC timer */
+	// 本地APIC定时器中断，SMP每个CPU本地时钟中断
 	set_intr_gate(LOCAL_TIMER_VECTOR, apic_timer_interrupt);
-
-	/* IPI vectors for APIC spurious and error interrupts */
+	// APIC伪中断、APIC硬件错误中断
 	set_intr_gate(SPURIOUS_APIC_VECTOR, spurious_interrupt);
 	set_intr_gate(ERROR_APIC_VECTOR, error_interrupt);
 #endif
@@ -488,11 +523,13 @@ void __init init_IRQ(void)
 	 * Set the clock to HZ Hz, we already have a valid
 	 * vector now:
 	 */
-	outb_p(0x34,0x43);		/* binary, mode 2, LSB/MSB, ch 0 */
-	outb_p(LATCH & 0xff , 0x40);	/* LSB */
-	outb(LATCH >> 8 , 0x40);	/* MSB */
+	// 配置PIT 8253定时器（IRQ0，时钟中断源）
+	outb_p(0x34,0x43);        /* binary, mode 2, LSB/MSB, ch 0 */
+	outb_p(LATCH & 0xff , 0x40);    /* LSB 写入计数低字节 */
+	outb(LATCH >> 8 , 0x40);    /* MSB 写入计数高字节 */
 
 #ifndef CONFIG_VISWS
+	// 注册IRQ2，从8259A PIC级联中断
 	setup_irq(2, &irq2);
 #endif
 
@@ -500,6 +537,7 @@ void __init init_IRQ(void)
 	 * External FPU? Set up irq13 if so, for
 	 * original braindamaged IBM FERR coupling.
 	 */
+	// 老式外部FPU协处理器，注册IRQ13浮点错误中断
 	if (boot_cpu_data.hard_math && !cpu_has_fpu)
 		setup_irq(13, &irq13);
 }

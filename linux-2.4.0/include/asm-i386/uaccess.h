@@ -77,10 +77,16 @@ extern inline int verify_area(int type, const void * addr, unsigned long size)
  * on our cache or tlb entries.
  */
 
+/**
+ * struct exception_table_entry - 异常表项（Linux2.4 i386）
+ * @insn: 预期会触发异常的内核指令的虚拟地址
+ * @fixup: 异常发生之后，要跳转的修复代码地址
+ */
 struct exception_table_entry
 {
-	unsigned long insn, fixup;
+    unsigned long insn, fixup;
 };
+
 
 /* Returns 0 if exception not found and fixup otherwise.  */
 extern unsigned long search_exception_table(unsigned long);

@@ -24,14 +24,28 @@
  * Interrupt controller descriptor. This is all we need
  * to describe about the low-level hardware. 
  */
+/**
+ * struct hw_interrupt_type
+ * Linux2.4 内核：硬件中断控制器操作抽象结构体（中断芯片描述符）
+ * 作用：对不同的中断控制器（8259A PIC / IOAPIC / 本地APIC）做统一抽象，
+ *       内核上层中断代码（do_IRQ）不需要关心底层是PIC还是APIC，统一调用这组回调函数。
+ * 每个irq_desc->handler 指向该结构。
+ */
 struct hw_interrupt_type {
-	const char * typename;
+	const char * typename;                  // 中断控制器名字，用于打印调试，如 "XT-PIC"、"IO-APIC"
+	// 启动/打开中断，第一次启用该IRQ，可做硬件初始化
 	unsigned int (*startup)(unsigned int irq);
+	// 关闭、销毁IRQ，释放硬件资源
 	void (*shutdown)(unsigned int irq);
+	// 使能中断（unmask，取消屏蔽）
 	void (*enable)(unsigned int irq);
+	// 屏蔽中断（mask）
 	void (*disable)(unsigned int irq);
+	// ack：应答中断，通知中断控制器"我收到这个中断了"，清除中断请求位IRR/ISR
 	void (*ack)(unsigned int irq);
+	// end：中断处理结束后的收尾动作；判断是否需要重新打开中断
 	void (*end)(unsigned int irq);
+	// 设置中断亲和性：把这个IRQ绑定到指定CPU掩码（SMP IOAPIC使用）
 	void (*set_affinity)(unsigned int irq, unsigned long mask);
 };
 

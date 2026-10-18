@@ -600,88 +600,118 @@ asmlinkage void __init start_kernel(void)
  * Interrupts are still disabled. Do necessary setups, then
  * enable them
  */
+	// 0. 大内核锁上锁，2.4全局大内核锁，保护内核临界区
 	lock_kernel();
+	// 打印内核版本banner
 	printk(linux_banner);
+	// 1. 架构相关初始化（x86）：检测内存、解析硬件、建立初步页表，提取boot command_line
 	setup_arch(&command_line);
+	// 打印内核启动命令行参数
 	printk("Kernel command line: %s\n", saved_command_line);
+	// 2. 解析命令行参数，处理启动选项
 	parse_options(command_line);
+	
+	// 3. 陷阱门初始化：设置异常/故障处理（缺页、除0、段错误等异常向量）
 	trap_init();
+	// 4. 硬件中断控制器初始化（8259A/IOAPIC），注册硬件中断向量
 	init_IRQ();
+	// 5. 调度器初始化：初始化runqueue、初始化init_task(0号进程)，调度相关数据结构
 	sched_init();
+	// 6. 时钟系统初始化，jiffies、PIT时钟中断注册
 	time_init();
+	// 7. 软中断初始化，初始化softirq向量、tasklet机制
 	softirq_init();
-
 	/*
 	 * HACK ALERT! This is early. We're enabling the console before
 	 * we've done PCI setups etc, and console_init() must be aware of
 	 * this. But we do want output early, in case something goes wrong.
 	 */
+	// 8. 控制台初始化，让printk可以输出到屏幕/串口
 	console_init();
 #ifdef CONFIG_MODULES
+	// 9. 内核模块子系统初始化
 	init_modules();
 #endif
 	if (prof_shift) {
 		unsigned int size;
 		/* only text is profiled */
+		// 内核性能剖析：分配统计buffer，统计内核代码执行采样
 		prof_len = (unsigned long) &_etext - (unsigned long) &_stext;
 		prof_len >>= prof_shift;
 		
 		size = prof_len * sizeof(unsigned int) + PAGE_SIZE-1;
 		prof_buffer = (unsigned int *) alloc_bootmem(size);
 	}
-
+	//10. slab内存缓存初始化，kmem_cache_create底层支持
 	kmem_cache_init();
+	//11. sti：汇编指令，开启本地硬件中断！【关键点：中断从此打开】
 	sti();
+	//12. 校准loops_per_jiffy，用于udelay忙等待
 	calibrate_delay();
 #ifdef CONFIG_BLK_DEV_INITRD
+	// 检测initrd临时根文件，防止内存覆盖损坏
 	if (initrd_start && !initrd_below_start_ok &&
 			initrd_start < min_low_pfn << PAGE_SHIFT) {
 		printk(KERN_CRIT "initrd overwritten (0x%08lx < 0x%08lx) - "
-		    "disabling it.\n",initrd_start,min_low_pfn << PAGE_SHIFT);
+			"disabling it.\n",initrd_start,min_low_pfn << PAGE_SHIFT);
 		initrd_start = 0;
 	}
 #endif
+	//13. 内存管理初始化，页描述符管理、物理内存可用区域建立
 	mem_init();
+	// 调整slab缓存大小
 	kmem_cache_sizes_init();
 #ifdef CONFIG_3215_CONSOLE
-        con3215_activate();
+		con3215_activate();
 #endif
 #ifdef CONFIG_PROC_FS
-	//proc 文件系统初始化，proc文件系统在 init_proc_fs 中被注册
+	//14. proc文件系统初始化，/proc目录创建
 	proc_root_init();
 #endif
 	mempages = num_physpages;
-
+	//15. fork_init：初始化PID管理、user_struct资源限制，max_threads计算
 	fork_init(mempages);
+	//16. 进程相关slab缓存：task_struct、mm_struct等cache
 	proc_caches_init();
+	//17. VFS虚拟文件系统缓存初始化
 	vfs_caches_init(mempages);
+	//18. buffer cache 块设备缓冲
 	buffer_init(mempages);
+	//19. page cache 页缓存
 	page_cache_init(mempages);
 	kiobuf_setup();
+	//20. 信号子系统初始化，信号队列、sigaction相关
 	signals_init();
+	//21. 块设备子系统初始化
 	bdev_init();
+	//22. inode缓存初始化
 	inode_init(mempages);
 #if defined(CONFIG_SYSVIPC)
+	// System V IPC初始化：消息队列、共享内存、信号量
 	ipc_init();
 #endif
 #if defined(CONFIG_QUOTA)
 	dquot_init_hash();
 #endif
+	// 检测CPU硬件bug
 	check_bugs();
 	printk("POSIX conformance testing by UNIFIX\n");
-
 	/* 
-	 *	We count on the initial thread going ok 
-	 *	Like idlers init is an unlocked kernel thread, which will
-	 *	make syscalls (and thus be locked).
+	 *  We count on the initial thread going ok 
+	 *  Like idlers init is an unlocked kernel thread, which will
+	 *  make syscalls (and thus be locked).
 	 */
+	//23. SMP多核初始化，启动其他CPU
 	smp_init();
-
-	//init 线程（进程），内核模块的加载也在init中
+	//24. 创建内核线程init（PID=1）
+	// CLONE_FS | CLONE_FILES | CLONE_SIGNAL：共享fs、fd、信号处理
 	kernel_thread(init, NULL, CLONE_FS | CLONE_FILES | CLONE_SIGNAL);
+	// 释放大内核锁
 	unlock_kernel();
+	//25. 设置need_resched=1，主动触发调度
 	current->need_resched = 1;
- 	cpu_idle();
+	//26. 进入cpu_idle，0号idle进程主循环，调度器接管系统
+	cpu_idle();
 }
 
 #ifdef CONFIG_BLK_DEV_INITRD
