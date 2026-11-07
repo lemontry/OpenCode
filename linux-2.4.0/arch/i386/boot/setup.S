@@ -34,6 +34,42 @@
  * <stiker@northlink.com>
  */
 
+/*
+ * 【Linux 2.4 x86 实模式 setup.S 总注释】
+ * 运行环境：CPU处于16位实模式，由bootsect（512字节引导扇区）加载，bootloader(LILO/syslinux等)也会加载它
+ * 前置流程：BIOS上电自检 → BIOS加载bootsect → bootsect把setup和内核镜像(zImage/bzImage)读到内存 → 跳转到setup.S执行
+ * 核心定位：Linux内核启动【实模式最后一站】，职责就是收集BIOS硬件信息、搭建切换保护模式的前置环境，最后跳入32位保护模式内核
+ *
+ * 全部工作拆解：
+ * 1. 校验自身完整性：检查末尾 SIG1(0xAA55)/SIG2(0x5A5A) 签名，确认setup完整加载，损坏则死机报错
+ * 2. 内核启动协议头部（HdrS）：给bootloader交互，标记内核类型（zImage低加载 / bzImage高加载LOADED_HIGH）、ramdisk地址、内核命令行、32位入口地址等
+ * 3. 通过BIOS中断收集硬件信息，存入 0x90000(INITSEG) 区域，后面32位内核启动后读取：
+ *    - int 0x15：E820/E801/88h 三套方案检测内存，生成E820内存布局（可用内存、保留内存、空洞）
+ *    - int 0x13：读取硬盘0、硬盘1的磁盘参数（柱面/磁头/扇区）
+ *    - int 0x11：获取BIOS设备位图，判断PS2鼠标是否存在
+ *    - int 0x15：检测MCA微通道总线、APM高级电源管理BIOS信息
+ *    - int 0x16：设置键盘重复速率
+ *    - int 0x10：调用video.S，探测显卡、支持选择显示模式
+ * 4. A20门开启：A20是20根地址线开关，开启后才能访问1MB以上高端内存(HMA)；先通过8042键盘控制器开启，再用0x92端口fast A20兜底，循环验证A20真正生效
+ * 5. GDT全局描述符表准备：构造平坦4G地址空间的代码段、数据段描述符；临时IDT（空）；lgdt加载GDT，为保护模式做准备
+ * 6. 内核镜像搬运（仅zImage）：zImage加载在低端0x10000，setup把它拷贝到0x1000；bzImage标记LOADED_HIGH，已经加载到0x100000，不需要搬运
+ * 7. 中断屏蔽：关闭NMI、屏蔽8259主从PIC中断，保护模式切换过程不被中断打扰
+ * 8. 切换保护模式：lmsw置PE位开启保护模式；0x66远跳转刷新指令流水线（清除实模式预取指令）
+ * 9. 最终跳转：跳到预先约定的32位内核入口：
+ *    - zImage：0x1000
+ *    - bzImage：0x100000（1M地址）
+ *
+ * 关键约束：
+ * ✅ 全程跑在16位实模式，只能使用BIOS中断服务；一旦跳入32位内核，不再依赖BIOS
+ * ✅ 收集到的硬件参数放在0x90000~0x901FF，这块内存在内核初始化、VFS/内存管理启动前不能覆盖
+ * ✅ 区分两种内核镜像：
+ *    zImage：小内核，加载到低端640K以内，需要setup搬运
+ *    bzImage：大内核，直接加载到1M以上高端内存，跳过搬运
+ * ✅ 不做内核解压！解压逻辑在32位内核入口之后
+ *
+ * 退出本代码之后：进入32位保护模式，开始内核解压、页表初始化、内存管理、驱动初始化等流程
+ */
+
 #define __ASSEMBLY__
 #include <linux/config.h>
 #include <asm/segment.h>
@@ -42,6 +78,7 @@
 #include <asm/boot.h>
 #include <asm/e820.h>
 
+/* 尾部签名，用来校验setup镜像是否完整 */
 /* Signature words to ensure LILO loaded us right */
 #define SIG1	0xAA55
 #define SIG2	0x5A5A
@@ -53,6 +90,7 @@ SETUPSEG = DEF_SETUPSEG		# 0x9020, this is the current segment
 
 DELTA_INITSEG = SETUPSEG - INITSEG	# 0x0020
 
+# 标记段边界，用于链接脚本区分text/data/bss
 .code16
 .globl begtext, begdata, begbss, endtext, enddata, endbss
 
@@ -69,8 +107,11 @@ start:
 
 # This is the setup header, and it must start at %cs:2 (old 0x9020:2)
 
-		.ascii	"HdrS"		# header signature
-		.word	0x0202		# header version number (>= 0x0105)
+# ======================== setup引导头（必须在 cs:2 位置，0x9020:2）========================
+# 引导头，遵循Linux实模式引导协议，LILO、bootsect、loadlin都会识别这个头部
+
+		.ascii	"HdrS"		# header signature  # 引导头魔术签名，识别标准Linux setup头
+		.word	0x0202		# header version number (>= 0x0105)  # 协议版本号 2.02，支持cmd_line_ptr等扩展字段
 					# or else old loadlin-1.5 will fail)
 realmode_swtch:	.word	0, 0		# default_switch, SETUPSEG
 start_sys_seg:	.word	SYSSEG
@@ -149,9 +190,12 @@ cmd_line_ptr:	.long 0			# (Header version 0x0202 or later)
 					# can be located anywhere in
 					# low memory 0x10000 or higher.
 
+# ======================== 引导头结束 ========================
+
 trampoline:	call	start_of_setup
 		.space	1024
 # End of setup header #####################################################
+# 引导头区域结束，预留1024字节
 
 start_of_setup:
 # Bootlin depends on this being done early

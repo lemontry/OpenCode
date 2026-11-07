@@ -46,8 +46,16 @@
 typedef int (*initcall_t)(void);
 typedef void (*exitcall_t)(void);
 
+/**
+ * 
+ *  __initcall_start = .;
+  .initcall.init : { *(.initcall.init) }
+  __initcall_end = .;
+ */
 extern initcall_t __initcall_start, __initcall_end;
 
+//定了两个函数
+//放到段 .initcall.init 和 .exitcall.exit
 #define __initcall(fn)								\
 	static initcall_t __initcall_##fn __init_call = fn
 #define __exitcall(fn)								\
@@ -86,6 +94,8 @@ extern struct kernel_param __setup_start, __setup_end;
 #define __FINIT		.previous
 #define __INITDATA	.section	".data.init","aw"
 
+//模块的初始化和卸载
+// 静态加载
 #define module_init(x)	__initcall(x);
 #define module_exit(x)	__exitcall(x);
 
@@ -108,6 +118,13 @@ extern struct kernel_param __setup_start, __setup_end;
  function. */
 typedef int (*__init_module_func_t)(void);
 typedef void (*__cleanup_module_func_t)(void);
+
+/**
+ * module_init(x) 模块初始化宏 2.4内核
+ * module_exit(x) 模块退出/反初始化宏 2.4内核
+ *
+ * 作用：给模块作者提供统一宏，把自定义init/exit函数绑定到内核识别的固定名字
+ */
 #define module_init(x) \
 	int init_module(void) __attribute__((alias(#x))); \
 	extern inline __init_module_func_t __init_module_inline(void) \

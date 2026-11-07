@@ -12,25 +12,36 @@ struct task_struct;	/* one of the stranger aspects of C forward declarations.. *
 extern void FASTCALL(__switch_to(struct task_struct *prev, struct task_struct *next));
 
 #define prepare_to_switch()	do { } while(0)
-#define switch_to(prev,next,last) do {					\
-	asm volatile("pushl %%esi\n\t"					\
-		     "pushl %%edi\n\t"					\
-		     "pushl %%ebp\n\t"					\
-		     "movl %%esp,%0\n\t"	/* save ESP */		\
-		     "movl %3,%%esp\n\t"	/* restore ESP */	\
-		     "movl $1f,%1\n\t"		/* save EIP */		\
-		     "pushl %4\n\t"		/* restore EIP */	\
-		     "jmp __switch_to\n"				\
-		     "1:\t"						\
-		     "popl %%ebp\n\t"					\
-		     "popl %%edi\n\t"					\
-		     "popl %%esi\n\t"					\
-		     :"=m" (prev->thread.esp),"=m" (prev->thread.eip),	\
-		      "=b" (last)					\
-		     :"m" (next->thread.esp),"m" (next->thread.eip),	\
-		      "a" (prev), "d" (next),				\
-		      "b" (prev));					\
+
+/**
+ * #define switch_to(prev,next,last)
+ * @prev: 将要被换下的旧进程 task_struct*
+ * @next: 将要切换上CPU的新进程 task_struct*
+ * @last: 输出参数，保存上一次被切换出去的进程指针
+ * 功能：x86 32位 Linux2.4 底层进程上下文切换宏，内嵌汇编
+ * 作用：保存prev进程的硬件上下文(栈、寄存器)，加载next进程的上下文，实现进程切换
+ * 注意：这是**进程上下文切换核心**，在schedule()内部调用
+ */
+#define switch_to(prev,next,last) do {                      \
+    asm volatile("pushl %%esi\n\t"                          \
+                 "pushl %%edi\n\t"                          \
+                 "pushl %%ebp\n\t"                          \
+                 "movl %%esp,%0\n\t"    /* save ESP：把旧进程当前栈指针ESP，存入prev->thread.esp */\
+                 "movl %3,%%esp\n\t"    /* restore ESP：加载next->thread.esp到ESP，切换栈！*/\
+                 "movl $1f,%1\n\t"      /* save EIP：把标签1的地址保存到prev->thread.eip，作为旧进程下次恢复执行的返回地址 */\
+                 "pushl %4\n\t"         /* restore EIP：把next->thread.eip压栈，作为ret的返回地址 */\
+                 "jmp __switch_to\n"                        \
+                 "1:\t"                                     \
+                 "popl %%ebp\n\t"                           \
+                 "popl %%edi\n\t"                           \
+                 "popl %%esi\n\t"                           \
+                 :"=m" (prev->thread.esp),"=m" (prev->thread.eip),  \
+                  "=b" (last)                                 \
+                 :"m" (next->thread.esp),"m" (next->thread.eip),    \
+                  "a" (prev), "d" (next),                     \
+                  "b" (prev));                                 \
 } while (0)
+
 
 #define _set_base(addr,base) do { unsigned long __pr; \
 __asm__ __volatile__ ("movw %%dx,%1\n\t" \
@@ -295,14 +306,21 @@ static inline unsigned long __cmpxchg(volatile void *ptr, unsigned long old,
 /* interrupt control.. */
 #define __save_flags(x)		__asm__ __volatile__("pushfl ; popl %0":"=g" (x): /* no input */)
 #define __restore_flags(x) 	__asm__ __volatile__("pushl %0 ; popfl": /* no output */ :"g" (x):"memory")
+
+// Linux2.4 x86-32，关闭全局中断（清除IF标志位）
 #define __cli() 		__asm__ __volatile__("cli": : :"memory")
+
+// Linux2.4 x86-32，开启本地CPU全局中断（置位EFLAGS的IF标志）
 #define __sti()			__asm__ __volatile__("sti": : :"memory")
 /* used in the idle loop; sti takes one instruction cycle to complete */
 #define safe_halt()		__asm__ __volatile__("sti; hlt": : :"memory")
 
 /* For spinlocks etc */
+//保存和恢复中断寄存器信息
 #define local_irq_save(x)	__asm__ __volatile__("pushfl ; popl %0 ; cli":"=g" (x): /* no input */ :"memory")
 #define local_irq_restore(x)	__restore_flags(x)
+
+//关闭和启动 CPU的中断控制标志
 #define local_irq_disable()	__cli()
 #define local_irq_enable()	__sti()
 

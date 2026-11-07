@@ -1,6 +1,22 @@
 #ifndef _I386_PGTABLE_3LEVEL_H
 #define _I386_PGTABLE_3LEVEL_H
 
+/***
+ * 用更加稀疏的矩阵，减少大部分情况下，页表占用的内存大小
+ * 
+ * 
+ */
+/**
+ * 
+[31 30]  [29 21]  [20 12]  [11 0]
+PGD idx   PMD idx   PTE idx  页内偏移
+
+- bits [31:30]：PGD 索引（2bit，0~3，一共 4 项）
+- bits [29:21]：PMD 索引（9bit，0~511）
+- bits [20:12]：PTE 索引（9bit，0~511）
+- bits [11:0]：页内偏移（12bit，4K 页）
+
+ */
 /*
  * Intel Physical Address Extension (PAE) Mode - three-level page
  * tables on PPro+ CPUs.
@@ -11,20 +27,25 @@
 /*
  * PGDIR_SHIFT determines what a top-level page table entry can map
  */
-#define PGDIR_SHIFT	30
-#define PTRS_PER_PGD	4
+// ARM 32 Linux 2.4 三级页表宏
+// PGDIR_SHIFT：PGD项对应的地址移位，单个PGD项映射的地址范围
+#define PGDIR_SHIFT 30
+// PGD表内表项数量
+#define PTRS_PER_PGD    4
 
 /*
  * PMD_SHIFT determines the size of the area a middle-level
  * page table can map
+ * PMD_SHIFT：PMD项对应的地址移位，单个PMD项映射的地址范围
  */
-#define PMD_SHIFT	21
-#define PTRS_PER_PMD	512
+#define PMD_SHIFT   21
+#define PTRS_PER_PMD    512
 
 /*
  * entries per page directory level
+ * 每一级页目录的表项数量
  */
-#define PTRS_PER_PTE	512
+#define PTRS_PER_PTE    512
 
 #define pte_ERROR(e) \
 	printk("%s:%d: bad pte %p(%08lx%08lx).\n", __FILE__, __LINE__, &(e), (e).pte_high, (e).pte_low)

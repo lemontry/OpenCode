@@ -54,89 +54,131 @@ void __up(struct semaphore *sem)
 }
 
 static spinlock_t semaphore_lock = SPIN_LOCK_UNLOCKED;
-
+/**
+ * __down - 信号量down失败后的睡眠等待逻辑，不可中断 (Linux2.4)
+ * @sem: 目标信号量
+ * 被汇编down里面的 __down_failed 调用；排他等待，TASK_UNINTERRUPTIBLE，信号不能打断
+ */
 void __down(struct semaphore * sem)
 {
-	struct task_struct *tsk = current;
-	DECLARE_WAITQUEUE(wait, tsk);
-	tsk->state = TASK_UNINTERRUPTIBLE;
-	add_wait_queue_exclusive(&sem->wait, &wait);
-
-	spin_lock_irq(&semaphore_lock);
-	sem->sleepers++;
-	for (;;) {
-		int sleepers = sem->sleepers;
-
-		/*
-		 * Add "everybody else" into it. They aren't
-		 * playing, because we own the spinlock.
-		 */
-		if (!atomic_add_negative(sleepers - 1, &sem->count)) {
-			sem->sleepers = 0;
-			break;
-		}
-		sem->sleepers = 1;	/* us - see -1 above */
-		spin_unlock_irq(&semaphore_lock);
-
-		schedule();
-		tsk->state = TASK_UNINTERRUPTIBLE;
-		spin_lock_irq(&semaphore_lock);
-	}
-	spin_unlock_irq(&semaphore_lock);
-	remove_wait_queue(&sem->wait, &wait);
-	tsk->state = TASK_RUNNING;
-	wake_up(&sem->wait);
+    // 获取当前进程描述符
+    struct task_struct *tsk = current;
+    // 栈上定义并初始化等待节点，绑定当前进程
+    DECLARE_WAITQUEUE(wait, tsk);
+    // 设置进程状态：不可中断睡眠
+    tsk->state = TASK_UNINTERRUPTIBLE;
+    // 添加排他等待节点，避免惊群，一次wake只唤醒一个等待者
+    add_wait_queue_exclusive(&sem->wait, &wait);
+    // 获取信号量全局自旋锁，关本地中断，保护sleepers、count临界区
+    spin_lock_irq(&semaphore_lock);
+    // sleepers计数+1，表示又多一个等待睡眠的进程
+    sem->sleepers++;
+    for (;;) {
+        int sleepers = sem->sleepers;
+        /*
+         * Add "everybody else" into it. They aren't
+         * playing, because we own the spinlock.
+         */
+        // atomic_add_negative：把(sleepers - 1)加到sem->count，返回相加后结果是否为负数
+        if (!atomic_add_negative(sleepers - 1, &sem->count)) {
+            // count >= 0：拿到信号量资源
+            sem->sleepers = 0;
+            break;
+        }
+        // 资源还是不够，sleepers置1，代表当前这个进程是等待者
+        sem->sleepers = 1;
+        // 解锁，开中断，让出CPU
+        spin_unlock_irq(&semaphore_lock);
+        // 调度，进入睡眠，等待up唤醒
+        schedule();
+        // 被唤醒回来，重新设置状态，准备再次检查条件
+        tsk->state = TASK_UNINTERRUPTIBLE;
+        // 再次拿锁，进入下一轮循环判断
+        spin_lock_irq(&semaphore_lock);
+    }
+    // 拿到资源，退出循环，释放自旋锁
+    spin_unlock_irq(&semaphore_lock);
+    // 将等待节点从等待队列摘除
+    remove_wait_queue(&sem->wait, &wait);
+    // 恢复进程为运行态
+    tsk->state = TASK_RUNNING;
+    // 唤醒下一个等待在信号量上的进程（传递唤醒）
+    wake_up(&sem->wait);
 }
 
+/**
+ * __down_interruptible - 可中断版本信号量获取的睡眠逻辑（Linux2.4）
+ * @sem: 目标信号量
+ * @retval: 返回值，0成功；-EINTR代表被信号打断
+ * 特点：TASK_INTERRUPTIBLE，可以被信号唤醒打断，是down_interruptible底层C实现
+ */
 int __down_interruptible(struct semaphore * sem)
 {
-	int retval = 0;
-	struct task_struct *tsk = current;
-	DECLARE_WAITQUEUE(wait, tsk);
-	tsk->state = TASK_INTERRUPTIBLE;
-	add_wait_queue_exclusive(&sem->wait, &wait);
-
-	spin_lock_irq(&semaphore_lock);
-	sem->sleepers ++;
-	for (;;) {
-		int sleepers = sem->sleepers;
-
-		/*
-		 * With signals pending, this turns into
-		 * the trylock failure case - we won't be
-		 * sleeping, and we* can't get the lock as
-		 * it has contention. Just correct the count
-		 * and exit.
-		 */
-		if (signal_pending(current)) {
-			retval = -EINTR;
-			sem->sleepers = 0;
-			atomic_add(sleepers, &sem->count);
-			break;
-		}
-
-		/*
-		 * Add "everybody else" into it. They aren't
-		 * playing, because we own the spinlock. The
-		 * "-1" is because we're still hoping to get
-		 * the lock.
-		 */
-		if (!atomic_add_negative(sleepers - 1, &sem->count)) {
-			sem->sleepers = 0;
-			break;
-		}
-		sem->sleepers = 1;	/* us - see -1 above */
-		spin_unlock_irq(&semaphore_lock);
-
-		schedule();
-		tsk->state = TASK_INTERRUPTIBLE;
-		spin_lock_irq(&semaphore_lock);
-	}
-	spin_unlock_irq(&semaphore_lock);
-	tsk->state = TASK_RUNNING;
-	remove_wait_queue(&sem->wait, &wait);
-	wake_up(&sem->wait);
-	return retval;
+    // 返回值初始化为0，默认成功拿到信号量
+    int retval = 0;
+    // 获取当前进程描述符
+    struct task_struct *tsk = current;
+    // 在栈上定义并初始化排他等待节点，绑定当前进程
+    DECLARE_WAITQUEUE(wait, tsk);
+    // 设置进程状态：可中断睡眠，可以被信号唤醒
+    tsk->state = TASK_INTERRUPTIBLE;
+    // 添加排他等待节点，避免惊群，一次wake只唤醒一个等待进程
+    add_wait_queue_exclusive(&sem->wait, &wait);
+    // 获取全局信号量自旋锁，关闭本地中断，保护sleepers、count临界区
+    spin_lock_irq(&semaphore_lock);
+    // 等待进程计数+1
+    sem->sleepers ++;
+    for (;;) {
+        int sleepers = sem->sleepers;
+        /*
+         * With signals pending, this turns into
+         * the trylock failure case - we won't be
+         * sleeping, and we* can't get the lock as
+         * it has contention. Just correct the count
+         * and exit.
+         */
+        // 检查当前进程是否有挂起信号
+        if (signal_pending(current)) {
+            // 标记返回值：被信号中断
+            retval = -EINTR;
+            sem->sleepers = 0;
+            // 修复count：把sleepers加回去，恢复信号量计数，相当于本次down没有执行
+            atomic_add(sleepers, &sem->count);
+            break;
+        }
+        /*
+         * Add "everybody else" into it. They aren't
+         * playing, because we own the spinlock. The
+         * "-1" is because we're still hoping to get
+         * the lock.
+         */
+        // atomic_add_negative：sem->count += (sleepers - 1)，返回相加后是否为负数
+		// 返回 sem->count 是否小于0
+        if (!atomic_add_negative(sleepers - 1, &sem->count)) {
+            // count >= 0，资源充足，成功拿到信号量
+            sem->sleepers = 0;
+            break;
+        }
+        // 资源仍然不足，sleepers置1，代表只有本进程继续等待
+        sem->sleepers = 1;
+        // 解锁、恢复中断
+        spin_unlock_irq(&semaphore_lock);
+        // 让出CPU睡眠，等待up唤醒或者信号唤醒
+        schedule();
+        // 唤醒返回，重新设置为可中断睡眠状态
+        tsk->state = TASK_INTERRUPTIBLE;
+        // 重新拿锁，进入循环判断
+        spin_lock_irq(&semaphore_lock);
+    }
+    // 退出循环，释放全局自旋锁
+    spin_unlock_irq(&semaphore_lock);
+    // 恢复进程状态为运行态
+    tsk->state = TASK_RUNNING;
+    // 将等待节点从等待队列摘除
+    remove_wait_queue(&sem->wait, &wait);
+    // 传递唤醒：唤醒下一个排他等待的进程
+    wake_up(&sem->wait);
+    return retval;
 }
 
 /*

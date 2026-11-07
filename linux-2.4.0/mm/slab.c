@@ -143,13 +143,23 @@ static unsigned long offslab_limit;
  * Slabs are chained into one ordered list: fully used, partial, then fully
  * free slabs.
  */
+/**
+ * slab_t - 描述一个slab块（Linux2.4 SLAB）
+ * 一个slab由连续物理页组成，里面存放多个同规格对象
+ */
 typedef struct slab_s {
-	struct list_head	list;
-	unsigned long		colouroff;
-	void			*s_mem;		/* including colour offset */
-	unsigned int		inuse;		/* num of objs active in slab */
-	kmem_bufctl_t		free;
+    // 挂载到 kmem_cache_t 的 slabs 链表
+    struct list_head    list;
+    // slab着色偏移，用来错开对象起始地址，降低CPU cache伪共享
+    unsigned long       colouroff;
+    // slab内第一个对象起始地址（已经加上colouroff着色偏移）
+    void                *s_mem;     /* including colour offset */
+    // 当前已经分配出去、正在使用的对象数量
+    unsigned int        inuse;      /* num of objs active in slab */
+    // 空闲对象链表索引，bufctl数组的下标，链式记录空闲对象
+    kmem_bufctl_t       free;
 } slab_t;
+
 
 #define slab_bufctl(slabp) \
 	((kmem_bufctl_t *)(((slab_t*)slabp)+1))
@@ -177,61 +187,91 @@ typedef struct cpucache_s {
  */
 
 #define CACHE_NAMELEN	20	/* max name length for a slab cache */
-
+/**
+ * struct kmem_cache_s （别名 kmem_cache_t）
+ * Linux 2.4 SLAB分配器的缓存描述符
+ * 每一个slab缓存（cache）对应一个该结构体实例；
+ * 例如 cache_cache、kmalloc-32、kmalloc-64、DMA版kmalloc缓存，都各有一个 kmem_cache_t
+ */
 struct kmem_cache_s {
-/* 1) each alloc & free */
-	/* full, partial first, then free */
-	struct list_head	slabs;
-	struct list_head	*firstnotfull;
-	unsigned int		objsize;
-	unsigned int	 	flags;	/* constant flags */
-	unsigned int		num;	/* # of objs per slab */
-	spinlock_t		spinlock;
+/* 1) each alloc & free 分配、释放路径高频访问字段 */
+    /* full, partial first, then free */
+    // slabs：本缓存下所有slab块链表
+    // 链表上顺序：满slab → 部分空闲slab → 完全空闲slab
+    struct list_head    slabs;
+    // firstnotfull：指向第一个【非满】的slab（partial或者free），加速分配查找
+    struct list_head    *firstnotfull;
+    // objsize：缓存中单个对象的大小（不含slab管理元数据，就是用户申请的大小）
+    unsigned int        objsize;
+    // flags：静态固定标志位，创建缓存时确定，运行期不变
+    unsigned int        flags;
+    // num：一块slab里面最多能存放多少个对象
+    unsigned int        num;
+    // spinlock：保护这个cache的slab链表操作锁
+    spinlock_t      spinlock;
 #ifdef CONFIG_SMP
-	unsigned int		batchcount;
+    // batchcount：SMP下per-cpu缓存批量移入/移出的数量
+    unsigned int        batchcount;
 #endif
 
-/* 2) slab additions /removals */
-	/* order of pgs per slab (2^n) */
-	unsigned int		gfporder;
+/* 2) slab additions /removals  slab扩容、回收相关 */
+    /* order of pgs per slab (2^n) */
+    // gfporder：每个slab占用连续页的阶，页数 = 1 << gfporder
+    unsigned int        gfporder;
 
-	/* force GFP flags, e.g. GFP_DMA */
-	unsigned int		gfpflags;
+    /* force GFP flags, e.g. GFP_DMA */
+    // gfpflags：分配slab物理页时强制带上的GFP标志，比如GFP_DMA就是DMA专用缓存
+    unsigned int        gfpflags;
 
-	size_t			colour;		/* cache colouring range */
-	unsigned int		colour_off;	/* colour offset */
-	unsigned int		colour_next;	/* cache colouring */
-	kmem_cache_t		*slabp_cache;
-	unsigned int		growing;
-	unsigned int		dflags;		/* dynamic flags */
+    // colour：着色总数，一共有多少种着色偏移
+    size_t          colour;
+    // colour_off：着色步进（偏移单位）
+    unsigned int        colour_off;
+    // colour_next：下一次新建slab使用的着色编号，轮询
+    unsigned int        colour_next;
+    // slabp_cache：slab描述符（struct slab）本身从哪个slab缓存分配
+    kmem_cache_t        *slabp_cache;
+    // growing：标记当前是否正在扩容新建slab，防止并发重复扩容
+    unsigned int        growing;
+    // dflags：动态标志，运行时变化
+    unsigned int        dflags;
 
-	/* constructor func */
-	void (*ctor)(void *, kmem_cache_t *, unsigned long);
+    /* constructor func */
+    // ctor：对象构造回调函数，新建对象时调用（初始化）
+    void (*ctor)(void *, kmem_cache_t *, unsigned long);
 
-	/* de-constructor func */
-	void (*dtor)(void *, kmem_cache_t *, unsigned long);
+    /* de-constructor func */
+    // dtor：对象析构回调，回收对象时调用
+    void (*dtor)(void *, kmem_cache_t *, unsigned long);
 
-	unsigned long		failures;
+    // failures：分配失败计数
+    unsigned long       failures;
 
-/* 3) cache creation/removal */
-	char			name[CACHE_NAMELEN];
-	struct list_head	next;
+/* 3) cache creation/removal 缓存全局管理 */
+    // name：缓存名字，比如 "kmem_cache"、"kmalloc-64"
+    char            name[CACHE_NAMELEN];
+    // next：挂入全局 cache_chain 链表
+    struct list_head    next;
+
 #ifdef CONFIG_SMP
-/* 4) per-cpu data */
-	cpucache_t		*cpudata[NR_CPUS];
+/* 4) per-cpu data SMP每CPU本地缓存 */
+    // cpudata：每个CPU私有缓存（cpucache_t），提升SMP并发分配性能，减少全局锁争抢
+    cpucache_t      *cpudata[NR_CPUS];
 #endif
+
 #if STATS
-	unsigned long		num_active;
-	unsigned long		num_allocations;
-	unsigned long		high_mark;
-	unsigned long		grown;
-	unsigned long		reaped;
-	unsigned long 		errors;
+    // 下面都是统计项，打开STATS宏才编译，用于调试观察
+    unsigned long       num_active;      // 当前活跃对象
+    unsigned long       num_allocations; // 总分配次数
+    unsigned long       high_mark;       // 历史最高对象水位
+    unsigned long       grown;           // 扩容新建slab次数
+    unsigned long       reaped;          // 回收slab次数
+    unsigned long       errors;          // 错误次数
 #ifdef CONFIG_SMP
-	atomic_t		allochit;
-	atomic_t		allocmiss;
-	atomic_t		freehit;
-	atomic_t		freemiss;
+    atomic_t        allochit;    // per-cpu缓存分配命中
+    atomic_t        allocmiss;   // per-cpu缓存分配未命中
+    atomic_t        freehit;     // per-cpu缓存释放命中
+    atomic_t        freemiss;    // per-cpu缓存释放未命中
 #endif
 #endif
 };
@@ -318,40 +358,68 @@ static int slab_break_gfp_order = BREAK_GFP_ORDER_LO;
 #define	GET_PAGE_SLAB(pg)     ((slab_t *)(pg)->list.prev)
 
 /* Size description struct for general caches. */
+/**
+ * cache_sizes_t - 预定义slab缓存规格条目，管理一组固定大小的slab缓存，Linux2.4
+ */
 typedef struct cache_sizes {
-	size_t		 cs_size;
-	kmem_cache_t	*cs_cachep;
-	kmem_cache_t	*cs_dmacachep;
+	// 该缓存条目对应的对象大小
+    size_t          cs_size;
+	// 普通内存域(ZONE_NORMAL)的slab缓存描述符
+    kmem_cache_t    *cs_cachep;
+	//  DMA内存域(ZONE_DMA)的slab缓存描述符
+    kmem_cache_t    *cs_dmacachep;
 } cache_sizes_t;
 
+/**
+ * cache_sizes - 全局数组，kmalloc内置固定大小slab缓存表
+ * 数组最后一项cs_size=0作为结束标记
+ * PAGE_SIZE=4096时额外增加32字节规格
+ */
 static cache_sizes_t cache_sizes[] = {
 #if PAGE_SIZE == 4096
-	{    32,	NULL, NULL},
+    {    32,    NULL, NULL},
 #endif
-	{    64,	NULL, NULL},
-	{   128,	NULL, NULL},
-	{   256,	NULL, NULL},
-	{   512,	NULL, NULL},
-	{  1024,	NULL, NULL},
-	{  2048,	NULL, NULL},
-	{  4096,	NULL, NULL},
-	{  8192,	NULL, NULL},
-	{ 16384,	NULL, NULL},
-	{ 32768,	NULL, NULL},
-	{ 65536,	NULL, NULL},
-	{131072,	NULL, NULL},
-	{     0,	NULL, NULL}
+    {    64,    NULL, NULL},
+    {   128,    NULL, NULL},
+    {   256,    NULL, NULL},
+    {   512,    NULL, NULL},
+    {  1024,    NULL, NULL},
+    {  2048,    NULL, NULL},
+    {  4096,    NULL, NULL},
+    {  8192,    NULL, NULL},
+    { 16384,    NULL, NULL},
+    { 32768,    NULL, NULL},
+    { 65536,    NULL, NULL},
+    {131072,    NULL, NULL},
+    {     0,    NULL, NULL}
 };
 
 /* internal cache of cache description objs */
+/**
+ * cache_cache：SLAB分配器的【元缓存 / 自举缓存】静态实例
+ * 类型：kmem_cache_t
+ * 作用：专门用来分配 kmem_cache_t 结构体本身
+ * 鸡生蛋问题：要创建其他slab缓存，需要kmem_cache_create；
+ * kmem_cache_create内部要分配kmem_cache_t，只能预先静态定义这个cache_cache
+ */
 static kmem_cache_t cache_cache = {
-	slabs:		LIST_HEAD_INIT(cache_cache.slabs),
-	firstnotfull:	&cache_cache.slabs,
-	objsize:	sizeof(kmem_cache_t),
-	flags:		SLAB_NO_REAP,
-	spinlock:	SPIN_LOCK_UNLOCKED,
-	colour_off:	L1_CACHE_BYTES,
-	name:		"kmem_cache",
+    // slabs：该缓存下所有slab块的链表头，静态初始化空链表
+    slabs:        LIST_HEAD_INIT(cache_cache.slabs),
+    // firstnotfull：初始指向slabs链表，代表第一个非满slab的位置；
+    // 链表为空时直接指向链表头，分配逻辑以此做判断
+    firstnotfull:   &cache_cache.slabs,
+    // objsize：这个缓存里面存放的对象大小 = kmem_cache_t结构体本身大小
+    objsize:    sizeof(kmem_cache_t),
+    // flags：SLAB_NO_REAP 标记：这个缓存不允许kswapd回收slab页面
+    // 重要：cache_cache是SLAB根基，一旦回收，所有slab缓存都会瘫痪，禁止回收
+    flags:       SLAB_NO_REAP,
+    // spinlock：缓存的自旋锁，初始化为未上锁状态
+    spinlock:   SPIN_LOCK_UNLOCKED,
+    // colour_off：着色偏移步长 = L1_CACHE_BYTES（L1 cache line大小）
+    // 着色的单位，每次切换着色就偏移一个cache line，避免硬件cache冲突
+    colour_off: L1_CACHE_BYTES,
+    // name：缓存名称，dmesg、proc文件系统查看时显示
+    name:       "kmem_cache",
 };
 
 /* Guard access to the cache-chain. */
@@ -402,61 +470,101 @@ static void kmem_cache_estimate (unsigned long gfporder, size_t size,
 }
 
 /* Initialisation - setup the `cache' cache. */
+/**
+ * kmem_cache_init - SLAB分配器第一阶段自举初始化
+ * __init：初始化函数，启动完成后该段内存可以被回收
+ * 调用位置：start_kernel()，setup_arch() 执行完毕之后，mem_init() 之前
+ * 前提：当前还在 bootmem 分配器阶段，伙伴系统尚未就绪
+ * 核心目标：初始化 cache_cache（专门用来分配 kmem_cache_t 自身的slab缓存），完成slab的自举
+ * 说明：cache_cache 是SLAB的“元缓存”——没有它，就无法调用 kmem_cache_create 创建其他缓存
+ */
 void __init kmem_cache_init(void)
 {
-	size_t left_over;
+    size_t left_over;
 
-	init_MUTEX(&cache_chain_sem);
-	INIT_LIST_HEAD(&cache_chain);
+    // 初始化互斥锁 cache_chain_sem，保护全局缓存链表 cache_chain
+    init_MUTEX(&cache_chain_sem);
+    // 初始化全局链表头 cache_chain，系统所有slab缓存（kmem_cache_t）都会挂在这个链表上
+    INIT_LIST_HEAD(&cache_chain);
 
-	kmem_cache_estimate(0, cache_cache.objsize, 0,
-			&left_over, &cache_cache.num);
-	if (!cache_cache.num)
-		BUG();
+    // kmem_cache_estimate：根据传入的对象大小，估算一个slab块里面最多能放多少个对象
+    // 参数：(gfp, objsize, align, &剩余空间left_over, &输出每个slab的对象个数num)
+    // cache_cache.objsize = sizeof(kmem_cache_t)，也就是这个缓存用来存放kmem_cache_t结构体
+    kmem_cache_estimate(0, cache_cache.objsize, 0,
+            &left_over, &cache_cache.num);
+    // 估算出来每个slab能容纳的对象数量不能为0，为0直接崩溃
+    if (!cache_cache.num)
+        BUG();
 
-	cache_cache.colour = left_over/cache_cache.colour_off;
-	cache_cache.colour_next = 0;
+    // colour：着色数量，slab着色（cache coloring），用来降低硬件cache冲突
+    // left_over：一个slab扣除所有对象之后剩下的空闲字节
+    // colour_off：每个着色步长
+    cache_cache.colour = left_over/cache_cache.colour_off;
+    // colour_next：下一次分配使用的着色偏移，轮询使用不同着色
+    cache_cache.colour_next = 0;
 }
-
 
 /* Initialisation - setup remaining internal and general caches.
  * Called after the gfp() functions have been enabled, and before smp_init().
  */
+/**
+ * kmem_cache_sizes_init
+ * __init：初始化函数，内核启动完成后该函数所在内存可以被释放
+ * 调用时机：start_kernel → mem_init() 之后
+ * 作用：遍历全局 cache_sizes[] 数组，批量创建 kmalloc 配套的一系列通用slab缓存
+ * 每一个尺寸创建两套缓存：普通缓存、DMA缓存（GFP_DMA分配使用）
+ */
 void __init kmem_cache_sizes_init(void)
 {
-	cache_sizes_t *sizes = cache_sizes;
-	char name[20];
-	/*
-	 * Fragmentation resistance on low memory - only use bigger
-	 * page orders on machines with more than 32MB of memory.
-	 */
-	if (num_physpages > (32 << 20) >> PAGE_SHIFT)
-		slab_break_gfp_order = BREAK_GFP_ORDER_HI;
-	do {
-		/* For performance, all the general caches are L1 aligned.
-		 * This should be particularly beneficial on SMP boxes, as it
-		 * eliminates "false sharing".
-		 * Note for systems short on memory removing the alignment will
-		 * allow tighter packing of the smaller caches. */
-		sprintf(name,"size-%Zd",sizes->cs_size);
-		if (!(sizes->cs_cachep =
-			kmem_cache_create(name, sizes->cs_size,
-					0, SLAB_HWCACHE_ALIGN, NULL, NULL))) {
-			BUG();
-		}
+    cache_sizes_t *sizes = cache_sizes;
+    char name[20];
+    /*
+     * Fragmentation resistance on low memory - only use bigger
+     * page orders on machines with more than 32MB of memory.
+     * 碎片控制策略：
+     * 物理内存大于32MB时，slab_break_gfp_order = BREAK_GFP_ORDER_HI，允许slab使用更高阶连续页；
+     * 小内存机器维持低阶，避免大连续页分配失败、加剧内存碎片
+     */
+    if (num_physpages > (32 << 20) >> PAGE_SHIFT)
+        slab_break_gfp_order = BREAK_GFP_ORDER_HI;
 
-		/* Inc off-slab bufctl limit until the ceiling is hit. */
-		if (!(OFF_SLAB(sizes->cs_cachep))) {
-			offslab_limit = sizes->cs_size-sizeof(slab_t);
-			offslab_limit /= 2;
-		}
-		sprintf(name, "size-%Zd(DMA)",sizes->cs_size);
-		sizes->cs_dmacachep = kmem_cache_create(name, sizes->cs_size, 0,
-			      SLAB_CACHE_DMA|SLAB_HWCACHE_ALIGN, NULL, NULL);
-		if (!sizes->cs_dmacachep)
-			BUG();
-		sizes++;
-	} while (sizes->cs_size);
+    do {
+        /* For performance, all the general caches are L1 aligned.
+         * This should be particularly beneficial on SMP boxes, as it
+         * eliminates "false sharing".
+         * Note for systems short on memory removing the alignment will
+         * allow tighter packing of the smaller caches.
+         * 所有kmalloc通用缓存开启硬件cache对齐 SLAB_HWCACHE_ALIGN
+         * 好处：SMP场景减少cache伪共享（false sharing）；
+         * 代价：对象之间有空隙，内存利用率稍微降低
+         */
+        sprintf(name,"size-%Zd",sizes->cs_size);
+        // 创建普通slab缓存，标志 SLAB_HWCACHE_ALIGN
+        if (!(sizes->cs_cachep =
+            kmem_cache_create(name, sizes->cs_size,
+                    0, SLAB_HWCACHE_ALIGN, NULL, NULL))) {
+            BUG();
+        }
+
+        /* Inc off-slab bufctl limit until the ceiling is hit. */
+        // OFF_SLAB：判断这个缓存是否使用【外部管理描述符】（bufctl放在slab页面之外）
+        // 如果不是off-slab（bufctl放在slab内部），更新offslab_limit阈值
+        // offslab_limit：判断什么时候切换为off-slab模式的阈值
+        if (!(OFF_SLAB(sizes->cs_cachep))) {
+            offslab_limit = sizes->cs_size-sizeof(slab_t);
+            offslab_limit /= 2;
+        }
+
+        sprintf(name, "size-%Zd(DMA)",sizes->cs_size);
+        // 创建DMA专用缓存，增加 SLAB_CACHE_DMA 标志
+        // 分配slab物理页时自动带上 GFP_DMA，从 ZONE_DMA 分配内存
+        sizes->cs_dmacachep = kmem_cache_create(name, sizes->cs_size, 0,
+                SLAB_CACHE_DMA|SLAB_HWCACHE_ALIGN, NULL, NULL);
+        if (!sizes->cs_dmacachep)
+            BUG();
+
+        sizes++;
+    } while (sizes->cs_size); // 循环直到cs_size为0（数组结束哨兵）
 }
 
 int __init kmem_cpucache_init(void)
@@ -607,211 +715,254 @@ static void kmem_slab_destroy (kmem_cache_t *cachep, slab_t *slabp)
  * cacheline.  This can be beneficial if you're counting cycles as closely
  * as davem.
  */
+/**
+ * kmem_cache_create - 创建一个新的SLAB缓存（Linux2.4）
+ * @name: 缓存名称字符串，用于调试查看
+ * @size: 单个对象的大小
+ * @offset: 对象着色偏移基准值（colour_off）
+ * @flags: SLAB控制标记，如 SLAB_HWCACHE_ALIGN、SLAB_CACHE_DMA、SLAB_POISON 等
+ * @ctor: 对象构造函数，对象首次分配时调用
+ * @dtor: 对象析构函数，对象销毁回收时调用
+ *
+ * 返回值：成功返回 kmem_cache_t* 缓存描述符；失败返回 NULL
+ *
+ * 核心逻辑：参数合法性校验 → 从cache_cache元缓存分配kmem_cache_t描述符
+ * 对齐处理、调试标记适配 → 计算gfporder、每个slab容纳对象数量、碎片评估
+ * 决定on-slab / off-slab管理模式 → 初始化缓存各个字段、SMP开启cpucache
+ * 加入全局cache_chain链表，同时检查重名缓存防止重复创建
+ */
 kmem_cache_t *
 kmem_cache_create (const char *name, size_t size, size_t offset,
-	unsigned long flags, void (*ctor)(void*, kmem_cache_t *, unsigned long),
-	void (*dtor)(void*, kmem_cache_t *, unsigned long))
+    unsigned long flags, void (*ctor)(void*, kmem_cache_t *, unsigned long),
+    void (*dtor)(void*, kmem_cache_t *, unsigned long))
 {
-	const char *func_nm = KERN_ERR "kmem_create: ";
-	size_t left_over, align, slab_size;
-	kmem_cache_t *cachep = NULL;
+    const char *func_nm = KERN_ERR "kmem_create: ";
+    size_t left_over, align, slab_size;
+    kmem_cache_t *cachep = NULL;
 
-	/*
-	 * Sanity checks... these are all serious usage bugs.
-	 */
-	if ((!name) ||
-		((strlen(name) >= CACHE_NAMELEN - 1)) ||
-		in_interrupt() ||
-		(size < BYTES_PER_WORD) ||
-		(size > (1<<MAX_OBJ_ORDER)*PAGE_SIZE) ||
-		(dtor && !ctor) ||
-		(offset < 0 || offset > size))
-			BUG();
+    /*
+     * Sanity checks... these are all serious usage bugs.
+     */
+    // 基础合法性校验，非法参数直接BUG
+    if ((!name) ||
+        ((strlen(name) >= CACHE_NAMELEN - 1)) ||
+        in_interrupt() ||
+        (size < BYTES_PER_WORD) ||
+        (size > (1<<MAX_OBJ_ORDER)*PAGE_SIZE) ||
+        (dtor && !ctor) ||
+        (offset < 0 || offset > size))
+            BUG();
 
 #if DEBUG
-	if ((flags & SLAB_DEBUG_INITIAL) && !ctor) {
-		/* No constructor, but inital state check requested */
-		printk("%sNo con, but init state check requested - %s\n", func_nm, name);
-		flags &= ~SLAB_DEBUG_INITIAL;
-	}
+    // 调试标记兼容处理：开启初始化检查但无构造函数，关闭该标记
+    if ((flags & SLAB_DEBUG_INITIAL) && !ctor) {
+        /* No constructor, but inital state check requested */
+        printk("%sNo con, but init state check requested - %s\n", func_nm, name);
+        flags &= ~SLAB_DEBUG_INITIAL;
+    }
 
-	if ((flags & SLAB_POISON) && ctor) {
-		/* request for poisoning, but we can't do that with a constructor */
-		printk("%sPoisoning requested, but con given - %s\n", func_nm, name);
-		flags &= ~SLAB_POISON;
-	}
+    // 开启毒化标记但提供构造函数，二者冲突，关闭毒化
+    if ((flags & SLAB_POISON) && ctor) {
+        /* request for poisoning, but we can't do that with a constructor */
+        printk("%sPoisoning requested, but con given - %s\n", func_nm, name);
+        flags &= ~SLAB_POISON;
+    }
 #if FORCED_DEBUG
-	if (size < (PAGE_SIZE>>3))
-		/*
-		 * do not red zone large object, causes severe
-		 * fragmentation.
-		 */
-		flags |= SLAB_RED_ZONE;
-	if (!ctor)
-		flags |= SLAB_POISON;
+    // 强制调试：小对象开启红区检测；无构造函数自动开启毒化
+    if (size < (PAGE_SIZE>>3))
+        /*
+         * do not red zone large object, causes severe
+         * fragmentation.
+         */
+        flags |= SLAB_RED_ZONE;
+    if (!ctor)
+        flags |= SLAB_POISON;
 #endif
 #endif
 
-	/*
-	 * Always checks flags, a caller might be expecting debug
-	 * support which isn't available.
-	 */
-	if (flags & ~CREATE_MASK)
-		BUG();
+    /*
+     * Always checks flags, a caller might be expecting debug
+     * support which isn't available.
+     */
+    // 过滤不支持的flag，非法标记直接BUG
+    if (flags & ~CREATE_MASK)
+        BUG();
 
-	/* Get cache's description obj. */
-	cachep = (kmem_cache_t *) kmem_cache_alloc(&cache_cache, SLAB_KERNEL);
-	if (!cachep)
-		goto opps;
-	memset(cachep, 0, sizeof(kmem_cache_t));
+    // 从元缓存cache_cache分配kmem_cache_t自身描述符（SLAB自举）
+    /* Get cache's description obj. */
+    cachep = (kmem_cache_t *) kmem_cache_alloc(&cache_cache, SLAB_KERNEL);
+    if (!cachep)
+        goto opps;
+    memset(cachep, 0, sizeof(kmem_cache_t));
 
-	/* Check that size is in terms of words.  This is needed to avoid
-	 * unaligned accesses for some archs when redzoning is used, and makes
-	 * sure any on-slab bufctl's are also correctly aligned.
-	 */
-	if (size & (BYTES_PER_WORD-1)) {
-		size += (BYTES_PER_WORD-1);
-		size &= ~(BYTES_PER_WORD-1);
-		printk("%sForcing size word alignment - %s\n", func_nm, name);
-	}
-	
+    /* Check that size is in terms of words.  This is needed to avoid
+     * unaligned accesses for some archs when redzoning is used, and makes
+     * sure any on-slab bufctl's are also correctly aligned.
+     */
+    // 强制对象大小按字对齐，避免非对齐访问、保证bufctl对齐
+    if (size & (BYTES_PER_WORD-1)) {
+        size += (BYTES_PER_WORD-1);
+        size &= ~(BYTES_PER_WORD-1);
+        printk("%sForcing size word alignment - %s\n", func_nm, name);
+    }
+    
 #if DEBUG
-	if (flags & SLAB_RED_ZONE) {
-		/*
-		 * There is no point trying to honour cache alignment
-		 * when redzoning.
-		 */
-		flags &= ~SLAB_HWCACHE_ALIGN;
-		size += 2*BYTES_PER_WORD;	/* words for redzone */
-	}
+    // 红区检测：关闭硬件缓存对齐，对象首尾增加2个字的红区
+    if (flags & SLAB_RED_ZONE) {
+        /*
+         * There is no point trying to honour cache alignment
+         * when redzoning.
+         */
+        flags &= ~SLAB_HWCACHE_ALIGN;
+        size += 2*BYTES_PER_WORD;   /* words for redzone */
+    }
 #endif
-	align = BYTES_PER_WORD;
-	if (flags & SLAB_HWCACHE_ALIGN)
-		align = L1_CACHE_BYTES;
+    // 对齐基准：默认字对齐；开启硬件缓存对齐则使用L1缓存行大小
+    align = BYTES_PER_WORD;
+    if (flags & SLAB_HWCACHE_ALIGN)
+        align = L1_CACHE_BYTES;
 
-	/* Determine if the slab management is 'on' or 'off' slab. */
-	if (size >= (PAGE_SIZE>>3))
-		/*
-		 * Size is large, assume best to place the slab management obj
-		 * off-slab (should allow better packing of objs).
-		 */
-		flags |= CFLGS_OFF_SLAB;
+    /* Determine if the slab management is 'on' or 'off' slab. */
+    // 大对象默认off-slab：slab_t、bufctl管理结构放在slab页外面
+    if (size >= (PAGE_SIZE>>3))
+        /*
+         * Size is large, assume best to place the slab management obj
+         * off-slab (should allow better packing of objs).
+         */
+        flags |= CFLGS_OFF_SLAB;
 
-	if (flags & SLAB_HWCACHE_ALIGN) {
-		/* Need to adjust size so that objs are cache aligned. */
-		/* Small obj size, can get at least two per cache line. */
-		/* FIXME: only power of 2 supported, was better */
-		while (size < align/2)
-			align /= 2;
-		size = (size+align-1)&(~(align-1));
-	}
+    if (flags & SLAB_HWCACHE_ALIGN) {
+        /* Need to adjust size so that objs are cache aligned. */
+        /* Small obj size, can get at least two per cache line. */
+        /* FIXME: only power of 2 supported, was better */
+        // 硬件缓存对齐：缩小对齐粒度，保证缓存行内可以放下多个对象
+        while (size < align/2)
+            align /= 2;
+        size = (size+align-1)&(~(align-1));
+    }
 
-	/* Cal size (in pages) of slabs, and the num of objs per slab.
-	 * This could be made much more intelligent.  For now, try to avoid
-	 * using high page-orders for slabs.  When the gfp() funcs are more
-	 * friendly towards high-order requests, this should be changed.
-	 */
-	do {
-		unsigned int break_flag = 0;
+    /* Cal size (in pages) of slabs, and the num of objs per slab.
+     * This could be made much more intelligent.  For now, try to avoid
+     * using high page-orders for slabs.  When the gfp() funcs are more
+     * friendly towards high-order requests, this should be changed.
+     */
+    // 循环计算合适的gfporder、每个slab容纳对象数量，评估内部碎片
+    do {
+        unsigned int break_flag = 0;
 cal_wastage:
-		kmem_cache_estimate(cachep->gfporder, size, flags,
-						&left_over, &cachep->num);
-		if (break_flag)
-			break;
-		if (cachep->gfporder >= MAX_GFP_ORDER)
-			break;
-		if (!cachep->num)
-			goto next;
-		if (flags & CFLGS_OFF_SLAB && cachep->num > offslab_limit) {
-			/* Oops, this num of objs will cause problems. */
-			cachep->gfporder--;
-			break_flag++;
-			goto cal_wastage;
-		}
+        // 估算：当前order下，一页可以放多少对象、剩余空间left_over
+        kmem_cache_estimate(cachep->gfporder, size, flags,
+                        &left_over, &cachep->num);
+        if (break_flag)
+            break;
+        if (cachep->gfporder >= MAX_GFP_ORDER)
+            break;
+        if (!cachep->num)
+            goto next;
+        // off-slab模式，对象数量超过上限，降低order重新计算
+        if (flags & CFLGS_OFF_SLAB && cachep->num > offslab_limit) {
+            /* Oops, this num of objs will cause problems. */
+            cachep->gfporder--;
+            break_flag++;
+            goto cal_wastage;
+        }
 
-		/*
-		 * Large num of objs is good, but v. large slabs are currently
-		 * bad for the gfp()s.
-		 */
-		if (cachep->gfporder >= slab_break_gfp_order)
-			break;
+        /*
+         * Large num of objs is good, but v. large slabs are currently
+         * bad for the gfp()s.
+         */
+        // 到达预设order上限，不再提升order
+        if (cachep->gfporder >= slab_break_gfp_order)
+            break;
 
-		if ((left_over*8) <= (PAGE_SIZE<<cachep->gfporder))
-			break;	/* Acceptable internal fragmentation. */
+        // 碎片比例可接受，停止提升order
+        if ((left_over*8) <= (PAGE_SIZE<<cachep->gfporder))
+            break;  /* Acceptable internal fragmentation. */
 next:
-		cachep->gfporder++;
-	} while (1);
+        // 碎片太大，提升order，尝试更大连续页块
+        cachep->gfporder++;
+    } while (1);
 
-	if (!cachep->num) {
-		printk("kmem_cache_create: couldn't create cache %s.\n", name);
-		kmem_cache_free(&cache_cache, cachep);
-		cachep = NULL;
-		goto opps;
-	}
-	slab_size = L1_CACHE_ALIGN(cachep->num*sizeof(kmem_bufctl_t)+sizeof(slab_t));
+    // 算不出可用对象数量，创建失败，释放cachep
+    if (!cachep->num) {
+        printk("kmem_cache_create: couldn't create cache %s.\n", name);
+        kmem_cache_free(&cache_cache, cachep);
+        cachep = NULL;
+        goto opps;
+    }
+    // 计算slab管理结构（slab_t + bufctl数组）占用大小，按L1缓存对齐
+    slab_size = L1_CACHE_ALIGN(cachep->num*sizeof(kmem_bufctl_t)+sizeof(slab_t));
 
-	/*
-	 * If the slab has been placed off-slab, and we have enough space then
-	 * move it on-slab. This is at the expense of any extra colouring.
-	 */
-	if (flags & CFLGS_OFF_SLAB && left_over >= slab_size) {
-		flags &= ~CFLGS_OFF_SLAB;
-		left_over -= slab_size;
-	}
+    /*
+     * If the slab has been placed off-slab, and we have enough space then
+     * move it on-slab. This is at the expense of any extra colouring.
+     */
+    // 原本off-slab，但slab内剩余空间足够放下管理结构，改成on-slab节省内存
+    if (flags & CFLGS_OFF_SLAB && left_over >= slab_size) {
+        flags &= ~CFLGS_OFF_SLAB;
+        left_over -= slab_size;
+    }
 
-	/* Offset must be a multiple of the alignment. */
-	offset += (align-1);
-	offset &= ~(align-1);
-	if (!offset)
-		offset = L1_CACHE_BYTES;
-	cachep->colour_off = offset;
-	cachep->colour = left_over/offset;
+    // 着色偏移向上对齐；offset为0时默认L1_CACHE_BYTES
+    offset += (align-1);
+    offset &= ~(align-1);
+    if (!offset)
+        offset = L1_CACHE_BYTES;
+    cachep->colour_off = offset;
+    // 着色数量：剩余空间 / 着色步长，用来生成不同colouroff，减少伪共享
+    cachep->colour = left_over/offset;
 
-	/* init remaining fields */
-	if (!cachep->gfporder && !(flags & CFLGS_OFF_SLAB))
-		flags |= CFLGS_OPTIMIZE;
+    /* init remaining fields */
+    // 单页 + on-slab 开启优化标记
+    if (!cachep->gfporder && !(flags & CFLGS_OFF_SLAB))
+        flags |= CFLGS_OPTIMIZE;
 
-	cachep->flags = flags;
-	cachep->gfpflags = 0;
-	if (flags & SLAB_CACHE_DMA)
-		cachep->gfpflags |= GFP_DMA;
-	spin_lock_init(&cachep->spinlock);
-	cachep->objsize = size;
-	INIT_LIST_HEAD(&cachep->slabs);
-	cachep->firstnotfull = &cachep->slabs;
+    cachep->flags = flags;
+    cachep->gfpflags = 0;
+    // DMA标记：分配底层页时使用GFP_DMA
+    if (flags & SLAB_CACHE_DMA)
+        cachep->gfpflags |= GFP_DMA;
+    spin_lock_init(&cachep->spinlock);
+    cachep->objsize = size;
+    // 初始化slab链表头
+    INIT_LIST_HEAD(&cachep->slabs);
+    cachep->firstnotfull = &cachep->slabs;
 
-	if (flags & CFLGS_OFF_SLAB)
-		cachep->slabp_cache = kmem_find_general_cachep(slab_size,0);
-	cachep->ctor = ctor;
-	cachep->dtor = dtor;
-	/* Copy name over so we don't have problems with unloaded modules */
-	strcpy(cachep->name, name);
+    // off-slab模式：管理结构从通用kmalloc缓存分配
+    if (flags & CFLGS_OFF_SLAB)
+        cachep->slabp_cache = kmem_find_general_cachep(slab_size,0);
+    cachep->ctor = ctor;
+    cachep->dtor = dtor;
+    // 拷贝缓存名字，防止模块卸载后名字指针失效
+    strcpy(cachep->name, name);
 
 #ifdef CONFIG_SMP
-	if (g_cpucache_up)
-		enable_cpucache(cachep);
+    // SMP架构：开启per-cpu缓存cpucache，批量预取对象减少锁竞争
+    if (g_cpucache_up)
+        enable_cpucache(cachep);
 #endif
-	/* Need the semaphore to access the chain. */
-	down(&cache_chain_sem);
-	{
-		struct list_head *p;
+    // 加全局信号量，遍历全局缓存链表，检查重名缓存
+    down(&cache_chain_sem);
+    {
+        struct list_head *p;
 
-		list_for_each(p, &cache_chain) {
-			kmem_cache_t *pc = list_entry(p, kmem_cache_t, next);
+        list_for_each(p, &cache_chain) {
+            kmem_cache_t *pc = list_entry(p, kmem_cache_t, next);
 
-			/* The name field is constant - no lock needed. */
-			if (!strcmp(pc->name, name))
-				BUG();
-		}
-	}
+            /* The name field is constant - no lock needed. */
+            if (!strcmp(pc->name, name))
+                BUG();
+        }
+    }
 
-	/* There is no reason to lock our new cache before we
-	 * link it in - no one knows about it yet...
-	 */
-	list_add(&cachep->next, &cache_chain);
-	up(&cache_chain_sem);
+    /* There is no reason to lock our new cache before we
+     * link it in - no one knows about it yet...
+     */
+    // 把新缓存挂入全局cache_chain链表
+    list_add(&cachep->next, &cache_chain);
+    up(&cache_chain_sem);
 opps:
-	return cachep;
+    return cachep;
 }
 
 /*
@@ -1263,76 +1414,118 @@ static inline void * kmem_cache_alloc_one_tail (kmem_cache_t *cachep,
 })
 
 #ifdef CONFIG_SMP
+/**
+ * kmem_cache_alloc_batch - 批量从slab缓存拿对象，填充当前CPU本地cpucache缓存
+ * @cachep: slab缓存描述符
+ * @flags: GFP分配标志
+ *
+ * 返回值：成功返回一个对象指针；cpucache填充后无可用对象返回NULL
+ * 说明：SMP架构优化，一次性批量取一批对象放到per-cpu缓存，减少频繁争抢全局cache自旋锁
+ */
 void* kmem_cache_alloc_batch(kmem_cache_t* cachep, int flags)
 {
-	int batchcount = cachep->batchcount;
-	cpucache_t* cc = cc_data(cachep);
+    // 单次批量搬运数量，取自缓存的batchcount
+    int batchcount = cachep->batchcount;
+    // 获取当前CPU的私有cpucache
+    cpucache_t* cc = cc_data(cachep);
 
-	spin_lock(&cachep->spinlock);
-	while (batchcount--) {
-		/* Get slab alloc is to come from. */
-		struct list_head *p = cachep->firstnotfull;
-		slab_t *slabp;
+    // 加全局slab缓存自旋锁，保护slab链表
+    spin_lock(&cachep->spinlock);
+    while (batchcount--) {
+        /* Get slab alloc is to come from. */
+        // 取第一个还有空闲对象的slab
+        struct list_head *p = cachep->firstnotfull;
+        slab_t *slabp;
 
-		if (p == &cachep->slabs)
-			break;
-		slabp = list_entry(p,slab_t, list);
-		cc_entry(cc)[cc->avail++] =
-				kmem_cache_alloc_one_tail(cachep, slabp);
-	}
-	spin_unlock(&cachep->spinlock);
+        // 没有半满slab，直接退出批量循环
+        if (p == &cachep->slabs)
+            break;
+        slabp = list_entry(p,slab_t, list);
+        // 从这个slab取出一个对象，存入cpu本地缓存数组，avail计数+1
+        cc_entry(cc)[cc->avail++] =
+                kmem_cache_alloc_one_tail(cachep, slabp);
+    }
+    // 释放全局自旋锁
+    spin_unlock(&cachep->spinlock);
 
-	if (cc->avail)
-		return cc_entry(cc)[--cc->avail];
-	return NULL;
+    // 如果本地缓存已经拿到对象，返回其中一个
+    if (cc->avail)
+        return cc_entry(cc)[--cc->avail];
+    return NULL;
 }
 #endif
 
+/**
+ * __kmem_cache_alloc
+ * @cachep: 目标slab缓存描述符 kmem_cache_t *
+ * @flags: GFP分配标志（GFP_KERNEL / GFP_ATOMIC等）
+ * static inline，slab分配器核心分配入口
+ * 返回值：成功返回空闲对象地址；失败返回NULL
+ *
+ * 分配优先路径（SMP）：Per-CPU本地缓存 → 批量填充本地缓存 → 全局slab链表取对象 → 新建slab
+ */
 static inline void * __kmem_cache_alloc (kmem_cache_t *cachep, int flags)
 {
-	unsigned long save_flags;
-	void* objp;
+    unsigned long save_flags;
+    void* objp;
 
-	kmem_cache_alloc_head(cachep, flags);
+    // 预检查：必要时触发slab的预分配/收缩、内存压力判断
+    kmem_cache_alloc_head(cachep, flags);
 try_again:
-	local_irq_save(save_flags);
+    // 关本地中断，防止中断里并发修改per-cpu缓存
+    local_irq_save(save_flags);
 #ifdef CONFIG_SMP
-	{
-		cpucache_t *cc = cc_data(cachep);
+    {
+        // 获取当前CPU对应的per-cpu缓存 cpucache_t
+        cpucache_t *cc = cc_data(cachep);
 
-		if (cc) {
-			if (cc->avail) {
-				STATS_INC_ALLOCHIT(cachep);
-				objp = cc_entry(cc)[--cc->avail];
-			} else {
-				STATS_INC_ALLOCMISS(cachep);
-				objp = kmem_cache_alloc_batch(cachep,flags);
-				if (!objp)
-					goto alloc_new_slab_nolock;
-			}
-		} else {
-			spin_lock(&cachep->spinlock);
-			objp = kmem_cache_alloc_one(cachep);
-			spin_unlock(&cachep->spinlock);
-		}
-	}
+        if (cc) {
+            // per-cpu缓存存在
+            if (cc->avail) {
+                // ✅ 命中：本地缓存还有空闲对象，直接拿
+                STATS_INC_ALLOCHIT(cachep);
+                // avail 是当前缓存里空闲对象计数，先减计数再取对象
+                objp = cc_entry(cc)[--cc->avail];
+            } else {
+                // ❌ 本地缓存空，未命中
+                STATS_INC_ALLOCMISS(cachep);
+                // 从全局slab链表批量拿一批对象填充到当前CPU的cpucache
+                objp = kmem_cache_alloc_batch(cachep,flags);
+                if (!objp)
+                    // 批量拿不到对象，需要新建slab，跳转到新建分支
+                    goto alloc_new_slab_nolock;
+            }
+        } else {
+            // 当前CPU没有分配per-cpu缓存，直接加全局锁，从slab链表取单个对象
+            spin_lock(&cachep->spinlock);
+            objp = kmem_cache_alloc_one(cachep);
+            spin_unlock(&cachep->spinlock);
+        }
+    }
 #else
-	objp = kmem_cache_alloc_one(cachep);
+    // UP单处理器：没有per-cpu缓存，直接从全局slab链表分配
+    objp = kmem_cache_alloc_one(cachep);
 #endif
-	local_irq_restore(save_flags);
-	return objp;
+    // 恢复本地中断
+    local_irq_restore(save_flags);
+    return objp;
+
 alloc_new_slab:
 #ifdef CONFIG_SMP
-	spin_unlock(&cachep->spinlock);
+    spin_unlock(&cachep->spinlock);
 alloc_new_slab_nolock:
 #endif
-	local_irq_restore(save_flags);
-	if (kmem_cache_grow(cachep, flags))
-		/* Someone may have stolen our objs.  Doesn't matter, we'll
-		 * just come back here again.
-		 */
-		goto try_again;
-	return NULL;
+    // 恢复中断，再去新建slab（新建slab会调用伙伴系统alloc_pages，不能在关中断、持锁上下文）
+    local_irq_restore(save_flags);
+    // kmem_cache_grow：向伙伴系统申请物理页，构建一块新的slab
+    if (kmem_cache_grow(cachep, flags))
+        /*
+         * 注释含义：grow成功，新slab已经加入cache的slabs链表；
+         * 有可能别的CPU抢先把新slab里对象拿走了，没关系，循环重试一次分配
+         */
+        goto try_again;
+    // grow失败，内存不足，返回NULL
+    return NULL;
 }
 
 /*

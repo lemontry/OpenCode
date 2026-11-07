@@ -685,49 +685,74 @@ do {	if((__sk)->backlog.tail == NULL) {		\
  * socket layer -> transport layer interface
  * transport -> network interface is defined by struct inet_proto
  */
+/**
+ * struct proto - 传输层协议操作集（Linux2.4）
+ * 属于协议栈下层接口，对应tcp_prot / udp_prot / raw_prot；
+ * proto_ops是BSD socket层，proto是传输层，proto_ops会向下调用proto里的回调
+ */
 struct proto {
-	void			(*close)(struct sock *sk, 
-					long timeout);
-	int			(*connect)(struct sock *sk,
-				        struct sockaddr *uaddr, 
-					int addr_len);
-	int			(*disconnect)(struct sock *sk, int flags);
+    // 关闭传输层sock，timeout为超时时间
+    void            (*close)(struct sock *sk, 
+                    long timeout);
+    // 传输层connect，完成三次握手相关逻辑
+    int             (*connect)(struct sock *sk,
+                        struct sockaddr *uaddr, 
+                        int addr_len);
+    // 断开连接
+    int             (*disconnect)(struct sock *sk, int flags);
 
-	struct sock *		(*accept) (struct sock *sk, int flags, int *err);
+    // TCP accept，从监听sk的后备队列取出新建连接sk
+    struct sock *       (*accept) (struct sock *sk, int flags, int *err);
 
-	int			(*ioctl)(struct sock *sk, int cmd,
-					 unsigned long arg);
-	int			(*init)(struct sock *sk);
-	int			(*destroy)(struct sock *sk);
-	void			(*shutdown)(struct sock *sk, int how);
-	int			(*setsockopt)(struct sock *sk, int level, 
-					int optname, char *optval, int optlen);
-	int			(*getsockopt)(struct sock *sk, int level, 
-					int optname, char *optval, 
-					int *option);  	 
-	int			(*sendmsg)(struct sock *sk, struct msghdr *msg,
-					   int len);
-	int			(*recvmsg)(struct sock *sk, struct msghdr *msg,
-					int len, int noblock, int flags, 
-					int *addr_len);
-	int			(*bind)(struct sock *sk, 
-					struct sockaddr *uaddr, int addr_len);
+    // 传输层ioctl控制
+    int             (*ioctl)(struct sock *sk, int cmd,
+                        unsigned long arg);
+    // sk创建时协议专属初始化，tcp_init/udp_init
+    int             (*init)(struct sock *sk);
+    // sk销毁时协议专属析构
+    int             (*destroy)(struct sock *sk);
+    // 传输层半关闭
+    void            (*shutdown)(struct sock *sk, int how);
+    // 设置协议选项
+    int             (*setsockopt)(struct sock *sk, int level, 
+                        int optname, char *optval, int optlen);
+    // 获取协议选项
+    int             (*getsockopt)(struct sock *sk, int level, 
+                        int optname, char *optval, 
+                        int *option);    
+    // 传输层发送消息
+    int             (*sendmsg)(struct sock *sk, struct msghdr *msg,
+                        int len);
+    // 传输层接收消息，noblock标记是否非阻塞
+    int             (*recvmsg)(struct sock *sk, struct msghdr *msg,
+                        int len, int noblock, int flags, 
+                        int *addr_len);
+    // 传输层bind，绑定端口地址
+    int             (*bind)(struct sock *sk, 
+                        struct sockaddr *uaddr, int addr_len);
 
-	int			(*backlog_rcv) (struct sock *sk, 
-						struct sk_buff *skb);
+    // 后备队列收包函数，软中断收到skb、sk有backlog时调用
+    int             (*backlog_rcv) (struct sock *sk, 
+                        struct sk_buff *skb);
 
-	/* Keeping track of sk's, looking them up, and port selection methods. */
-	void			(*hash)(struct sock *sk);
-	void			(*unhash)(struct sock *sk);
-	int			(*get_port)(struct sock *sk, unsigned short snum);
+    /* Keeping track of sk's, looking them up, and port selection methods. */
+    // 将sk挂入协议全局哈希表
+    void            (*hash)(struct sock *sk);
+    // 从协议全局哈希表摘除sk
+    void            (*unhash)(struct sock *sk);
+    // 分配/校验端口，自动选端口或者校验指定端口
+    int             (*get_port)(struct sock *sk, unsigned short snum);
 
-	char			name[32];
+    // 协议名称，如"TCP" "UDP"
+    char            name[32];
 
-	struct {
-		int inuse;
-		u8  __pad[SMP_CACHE_BYTES - sizeof(int)];
-	} stats[NR_CPUS];
+    // 每个CPU独立统计计数，做缓存行填充防止伪共享
+    struct {
+        int inuse;
+        u8  __pad[SMP_CACHE_BYTES - sizeof(int)];
+    } stats[NR_CPUS];
 };
+
 
 /* Called with local bh disabled */
 static void __inline__ sock_prot_inc_use(struct proto *prot)

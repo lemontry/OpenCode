@@ -14,48 +14,77 @@
 
 #define MAX_ORDER 10
 
+/**
+ * free_area_struct - 伙伴系统中同一阶的空闲页管理结构
+ */
 typedef struct free_area_struct {
-	struct list_head	free_list;
-	unsigned int		*map;
+    // 该阶空闲页块链表
+    struct list_head    free_list;
+    // 伙伴位图，记录伙伴块状态
+    unsigned int        *map;
 } free_area_t;
 
 struct pglist_data;
 
+/**
+ * zone_struct - 内存域描述符，Linux2.4，ZONE_DMA / ZONE_NORMAL / ZONE_HIGHMEM
+ */
 typedef struct zone_struct {
-	/*
-	 * Commonly accessed fields:
-	 */
-	spinlock_t		lock;
-	unsigned long		offset;
-	unsigned long		free_pages;
-	unsigned long		inactive_clean_pages;
-	unsigned long		inactive_dirty_pages;
-	unsigned long		pages_min, pages_low, pages_high;
+    /*
+     * Commonly accessed fields:
+     */
+    // zone保护自旋锁
+    spinlock_t      lock;
+    // 本zone在全局mem_map里的页偏移
+    unsigned long       offset;
+    // 当前zone空闲页总数
+    unsigned long       free_pages;
+    // 非活跃干净页计数
+    unsigned long       inactive_clean_pages;
+    // 非活跃脏页计数
+    unsigned long       inactive_dirty_pages;
+    // 内存水位：min / low / high
+    unsigned long       pages_min, pages_low, pages_high;
 
-	/*
-	 * free areas of different sizes
-	 */
-	struct list_head	inactive_clean_list;
-	free_area_t		free_area[MAX_ORDER];
+    /*
+     * free areas of different sizes
+     */
+    // 非活跃干净页链表
+    struct list_head    inactive_clean_list;
+    // 伙伴系统，0阶~MAX_ORDER-1阶空闲页
+    free_area_t     free_area[MAX_ORDER];
 
-	/*
-	 * rarely used fields:
-	 */
-	char			*name;
-	unsigned long		size;
-	/*
-	 * Discontig memory support fields.
-	 */
-	struct pglist_data	*zone_pgdat;
-	unsigned long		zone_start_paddr;
-	unsigned long		zone_start_mapnr;
-	struct page		*zone_mem_map;
+    /*
+     * rarely used fields:
+     */
+    // zone名字，"DMA" / "Normal" / "HighMem"
+    char            *name;
+    // zone总页数
+    unsigned long       size;
+    /*
+     * Discontig memory support fields.
+     */
+    // 所属内存节点pgdat
+    struct pglist_data  *zone_pgdat;
+    // zone起始物理地址
+    unsigned long       zone_start_paddr;
+    // zone起始页帧号
+    unsigned long       zone_start_mapnr;
+    // 本zone的page数组起始
+    struct page     *zone_mem_map;
 } zone_t;
 
-#define ZONE_DMA		0
-#define ZONE_NORMAL		1
-#define ZONE_HIGHMEM		2
-#define MAX_NR_ZONES		3
+// DMA内存域，ISA设备只能访问低于16MB内存
+// 老 ISA 设备，天生硬件缺陷：它的地址线只有 20 根，最多只能寻址 0~16MB 的物理内存。
+// 你给它分配一个 20MB 位置的物理页，这个设备根本看不见、没法读写。
+#define ZONE_DMA        0
+// 普通内存域，可以直接内核线性映射
+#define ZONE_NORMAL     1
+// 高端内存域，32位内核无法直接线性映射，需要kmap临时映射
+#define ZONE_HIGHMEM        2
+// 内存域总数
+#define MAX_NR_ZONES        3
+
 
 /*
  * One allocation request operates on a zonelist. A zonelist
@@ -68,29 +97,51 @@ typedef struct zone_struct {
  * so despite the zonelist table being relatively big, the cache
  * footprint of this construct is very small.
  */
+/**
+ * zonelist_t - 内存分配优先级链表，描述一次GFP分配尝试zone的顺序
+ * 不同gfp_mask对应不同的zonelist，分配时按数组顺序依次尝试zone
+ */
 typedef struct zonelist_struct {
-	zone_t * zones [MAX_NR_ZONES+1]; // NULL delimited
-	int gfp_mask;
+    // zone指针数组，以NULL作为结束标记
+    zone_t * zones [MAX_NR_ZONES+1]; // NULL delimited
+    // 该zonelist对应的GFP掩码
+    int gfp_mask;
 } zonelist_t;
 
 #define NR_GFPINDEX		0x100
 
 struct bootmem_data;
+/**
+ * pglist_data - NUMA内存节点描述符，Linux2.4
+ */
 typedef struct pglist_data {
-	zone_t node_zones[MAX_NR_ZONES];
-	zonelist_t node_zonelists[NR_GFPINDEX];
-	struct page *node_mem_map;
-	unsigned long *valid_addr_bitmap;
-	struct bootmem_data *bdata;
-	unsigned long node_start_paddr;
-	unsigned long node_start_mapnr;
-	unsigned long node_size;
-	int node_id;
-	struct pglist_data *node_next;
+    // 该节点包含的内存域：ZONE_DMA ZONE_NORMAL ZONE_HIGHMEM
+    zone_t node_zones[MAX_NR_ZONES];
+    // 内存分配优先级链表，GFP不同类型对应不同zonelist
+    zonelist_t node_zonelists[NR_GFPINDEX];
+    // 当前节点的page数组起始
+    struct page *node_mem_map;
+    // 有效物理页位图，标记该节点哪些地址有内存
+    unsigned long *valid_addr_bitmap;
+    // bootmem管理结构体，内核启动阶段内存分配器
+    struct bootmem_data *bdata;
+    // 节点起始物理地址
+    unsigned long node_start_paddr;
+    // 节点起始页帧号
+    unsigned long node_start_mapnr;
+    // 节点总页数
+    unsigned long node_size;
+    // NUMA节点ID
+    int node_id;
+    // 下一个节点，构成单向链表
+    struct pglist_data *node_next;
 } pg_data_t;
 
+// 系统总的NUMA节点数量
 extern int numnodes;
+// NUMA节点链表头
 extern pg_data_t *pgdat_list;
+
 
 #define memclass(pgzone, tzone)	(((pgzone)->zone_pgdat == (tzone)->zone_pgdat) \
 			&& (((pgzone) - (pgzone)->zone_pgdat->node_zones) <= \

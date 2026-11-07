@@ -210,46 +210,61 @@ out_bad:
  * the swap entry is no longer in use.
  */
 
+/**
+ * read_swap_cache_async - 从swap分区读取换出的页面，优先查找swap cache，异步读swap页
+ * @entry: swap句柄，用来定位swap分区+槽位
+ * @wait: 是否阻塞等待IO完成（0=异步，1=同步等待）
+ * @return: 成功返回page结构体指针；未找到/分配失败返回NULL
+ */
 struct page * read_swap_cache_async(swp_entry_t entry, int wait)
 {
-	struct page *found_page = 0, *new_page;
-	unsigned long new_page_addr;
-	
-	/*
-	 * Make sure the swap entry is still in use.
-	 */
-	if (!swap_duplicate(entry))	/* Account for the swap cache */
-		goto out;
-	/*
-	 * Look for the page in the swap cache.
-	 */
-	found_page = lookup_swap_cache(entry);
-	if (found_page)
-		goto out_free_swap;
+    struct page *found_page = 0, *new_page;
+    unsigned long new_page_addr;
+    
+    /*
+     * Make sure the swap entry is still in use.
+     */
+    // 增加swap entry引用计数，确认这个swap槽位有效、没有被释放
+    if (!swap_duplicate(entry)) /* Account for the swap cache */
+        goto out;
+    /*
+     * Look for the page in the swap cache.
+     */
+    // 先查swap cache：页面是否已经被别的进程读入内存了
+    found_page = lookup_swap_cache(entry);
+    if (found_page)
+        goto out_free_swap;
 
-	new_page_addr = __get_free_page(GFP_USER);
-	if (!new_page_addr)
-		goto out_free_swap;	/* Out of memory */
-	new_page = virt_to_page(new_page_addr);
+    // 分配一页物理内存，GFP_USER，用于用户空间页面
+    new_page_addr = __get_free_page(GFP_USER);
+    if (!new_page_addr)
+        goto out_free_swap; /* Out of memory */
+    new_page = virt_to_page(new_page_addr);
 
-	/*
-	 * Check the swap cache again, in case we stalled above.
-	 */
-	found_page = lookup_swap_cache(entry);
-	if (found_page)
-		goto out_free_page;
-	/* 
-	 * Add it to the swap cache and read its contents.
-	 */
-	lock_page(new_page);
-	add_to_swap_cache(new_page, entry);
-	rw_swap_page(READ, new_page, wait);
-	return new_page;
+    /*
+     * Check the swap cache again, in case we stalled above.
+     */
+    // 二次检查swap cache：分配内存期间，别的进程可能已经把这页读进来了（防竞态）
+    found_page = lookup_swap_cache(entry);
+    if (found_page)
+        goto out_free_page;
+    /* 
+     * Add it to the swap cache and read its contents.
+     */
+    // 锁定页面，防止其他并发操作该page
+    lock_page(new_page);
+    // 将page加入swap cache，绑定swap entry
+    add_to_swap_cache(new_page, entry);
+    // 发起swap IO，从swap分区读数据到这个page
+    rw_swap_page(READ, new_page, wait);
+    return new_page;
 
+// 分配完页面，但发现已经有别的进程载入，释放刚分配的页面
 out_free_page:
-	page_cache_release(new_page);
+    page_cache_release(new_page);
+// swap entry引用计数减回去
 out_free_swap:
-	swap_free(entry);
+    swap_free(entry);
 out:
-	return found_page;
+    return found_page;
 }

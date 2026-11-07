@@ -149,43 +149,78 @@ extern unsigned long empty_zero_page[1024];
  * the page directory entry points directly to a 4MB-aligned block of
  * memory. 
  */
-#define _PAGE_BIT_PRESENT	0
-#define _PAGE_BIT_RW		1
-#define _PAGE_BIT_USER		2
-#define _PAGE_BIT_PWT		3
-#define _PAGE_BIT_PCD		4
-#define _PAGE_BIT_ACCESSED	5
-#define _PAGE_BIT_DIRTY		6
-#define _PAGE_BIT_PSE		7	/* 4 MB (or 2MB) page, Pentium+, if present.. */
-#define _PAGE_BIT_GLOBAL	8	/* Global TLB entry PPro+ */
+/**
+ * x86 32 页表项标志位定义，位编号宏 + 掩码宏
+ */
+// 页存在位编号
+#define _PAGE_BIT_PRESENT   0
+// 读写权限位编号
+#define _PAGE_BIT_RW        1
+// 用户/内核位编号
+#define _PAGE_BIT_USER      2
+// 写直达 PWT 位编号
+#define _PAGE_BIT_PWT       3
+// Cache 禁止 PCD 位编号
+#define _PAGE_BIT_PCD       4
+// 访问位编号
+#define _PAGE_BIT_ACCESSED  5
+// 脏位编号
+#define _PAGE_BIT_DIRTY     6
+// 大页 PSE 位编号，Pentium 及以上支持
+#define _PAGE_BIT_PSE       7   /* 4 MB (or 2MB) page, Pentium+, if present.. */
+// 全局TLB位编号，PPro及以上支持
+#define _PAGE_BIT_GLOBAL    8   /* Global TLB entry PPro+ */
 
-#define _PAGE_PRESENT	0x001
-#define _PAGE_RW	0x002
-#define _PAGE_USER	0x004
-#define _PAGE_PWT	0x008
-#define _PAGE_PCD	0x010
-#define _PAGE_ACCESSED	0x020
-#define _PAGE_DIRTY	0x040
-#define _PAGE_PSE	0x080	/* 4 MB (or 2MB) page, Pentium+, if present.. */
-#define _PAGE_GLOBAL	0x100	/* Global TLB entry PPro+ */
+// 页存在掩码：页在内存中
+#define _PAGE_PRESENT   0x001
+// 可写掩码
+#define _PAGE_RW    0x002
+// 用户态可访问掩码
+#define _PAGE_USER  0x004
+// PWT：写直达缓存
+#define _PAGE_PWT   0x008
+// PCD：禁止缓存
+#define _PAGE_PCD   0x010
+// 访问位：CPU读/写该页时自动置1
+#define _PAGE_ACCESSED  0x020
+// 脏位：CPU写该页时自动置1
+#define _PAGE_DIRTY 0x040
+// PSE：开启大页
+#define _PAGE_PSE   0x080   /* 4 MB (or 2MB) page, Pentium+, if present.. */
+// GLOBAL：全局TLB项，切换CR3时不刷新该TLB
+#define _PAGE_GLOBAL    0x100   /* Global TLB entry PPro+ */
 
-#define _PAGE_PROTNONE	0x080	/* If not present */
+// PROTNONE：页不存在时，用该位标记“无权限”
+#define _PAGE_PROTNONE  0x080   /* If not present */
 
-#define _PAGE_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY)
-#define _KERNPG_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED | _PAGE_DIRTY)
-#define _PAGE_CHG_MASK	(PTE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
+/**
+ * 预定义页表项组合标志，包含页目录表属性、VMA保护属性、内核映射页属性
+ */
+// 普通用户页表（PGD/PMD/PTE页目录）的属性
+#define _PAGE_TABLE (_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY)
+// 内核页表，不设置_USER位，仅内核可访问
+#define _KERNPG_TABLE   (_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED | _PAGE_DIRTY)
+// 修改掩码：只允许修改物理页号、访问位、脏位，权限位保留
+#define _PAGE_CHG_MASK  (PTE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY)
 
-#define PAGE_NONE	__pgprot(_PAGE_PROTNONE | _PAGE_ACCESSED)
-#define PAGE_SHARED	__pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | _PAGE_ACCESSED)
-#define PAGE_COPY	__pgprot(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED)
-#define PAGE_READONLY	__pgprot(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED)
+// 无访问权限，PROTNONE，触发缺页
+#define PAGE_NONE   __pgprot(_PAGE_PROTNONE | _PAGE_ACCESSED)
+// 用户共享可读写页
+#define PAGE_SHARED __pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | _PAGE_ACCESSED)
+// COW复制页，用户只读，写时拷贝
+#define PAGE_COPY   __pgprot(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED)
+// 用户只读页
+#define PAGE_READONLY   __pgprot(_PAGE_PRESENT | _PAGE_USER | _PAGE_ACCESSED)
 
+// 内核正常可读写映射页
 #define __PAGE_KERNEL \
-	(_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY | _PAGE_ACCESSED)
+    (_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY | _PAGE_ACCESSED)
+// 内核无缓存映射页（PCD=1）
 #define __PAGE_KERNEL_NOCACHE \
-	(_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY | _PAGE_PCD | _PAGE_ACCESSED)
+    (_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY | _PAGE_PCD | _PAGE_ACCESSED)
+// 内核只读映射页
 #define __PAGE_KERNEL_RO \
-	(_PAGE_PRESENT | _PAGE_DIRTY | _PAGE_ACCESSED)
+    (_PAGE_PRESENT | _PAGE_DIRTY | _PAGE_ACCESSED)
 
 #ifdef CONFIG_X86_PGE
 # define MAKE_GLOBAL(x) __pgprot((x) | _PAGE_GLOBAL)

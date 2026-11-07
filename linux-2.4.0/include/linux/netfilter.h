@@ -41,16 +41,25 @@ typedef unsigned int nf_hookfn(unsigned int hooknum,
 			       const struct net_device *out,
 			       int (*okfn)(struct sk_buff *));
 
+/**
+ * struct nf_hook_ops - netfilter钩子注册描述结构体（Linux2.4）
+ * 用来向netfilter框架注册一个钩子函数；注册后挂入nf_hooks二维链表
+ */
 struct nf_hook_ops
 {
-	struct list_head list;
+    // 链表节点，注册成功后链入 nf_hooks[pf][hooknum] 链表
+    struct list_head list;
 
-	/* User fills in from here down. */
-	nf_hookfn *hook;
-	int pf;
-	int hooknum;
-	/* Hooks are ordered in ascending priority. */
-	int priority;
+    /* User fills in from here down. */
+    // 钩子回调函数，报文到达该钩子点时执行
+    nf_hookfn *hook;
+    // 协议族，比如 PF_INET（IPv4）
+    int pf;
+    // 钩子点编号：NF_IP_PRE_ROUTING / NF_IP_LOCAL_IN / NF_IP_FORWARD / NF_IP_LOCAL_OUT / NF_IP_POST_ROUTING
+    int hooknum;
+    /* Hooks are ordered in ascending priority. */
+    // 优先级，数字越小越先执行
+    int priority;
 };
 
 struct nf_sockopt_ops

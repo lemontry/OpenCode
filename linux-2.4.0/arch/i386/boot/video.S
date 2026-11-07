@@ -11,6 +11,20 @@
  *
  */
 
+ /**
+ * video.S - Linux 2.4 setup阶段视频初始化汇编（16位实模式，被setup.S调用）
+ * 作用：在内核启动早期、保护模式开启之前，依靠BIOS int 0x10视频中断完成显卡识别、视频模式探测、用户交互选模式、设置文本/vesa图形模式；
+ * 1. 识别显卡类型：CGA/MDA/HGA / EGA / VGA / 各类SVGA（S3、Trident、Cirrus、ATI等）；
+ * 2. 自动探测VESA标准模式、SVGA厂商私有模式，构建可用视频模式表；
+ * 3. 支持启动交互菜单：30秒超时，回车列出全部模式、空格使用默认80x25，支持输入编号/hex模式号/scan扫描；
+ * 4. 支持多种VGA文本模式（80x25、80x28、80x30、80x34、80x43、80x50、80x60），直接操作VGA CRTC寄存器定制扫描线、字体；
+ * 5. 可选CONFIG_VIDEO_RETAIN：切换模式前保存显存内容，切换完成后恢复屏幕画面；
+ * 6. 设置完成后采集视频参数（行列、光标位置、页、字体、LFB线性帧缓冲地址/大小/色深、VESA保护模式接口），写入约定内存参数区，供后续内核console驱动读取；
+ * 7. 支持VESA LFB图形模式、ThinkPad图形hack；模式切换失败自动回退；
+ * 只在setup实模式阶段运行，不包含内核console驱动，仅做启动时视频环境准备与参数采集。
+ */
+
+
 #include <linux/config.h> /* for CONFIG_VIDEO_* */
 
 /* Enable autodetection of SVGA adapters and modes. */

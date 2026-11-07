@@ -258,7 +258,12 @@ extern unsigned int mca_pentium_flag;
 /*
  * User space process size: 3GB (default).
  */
-#define TASK_SIZE	(PAGE_OFFSET)
+/**
+ * TASK_SIZE - 用户态虚拟地址空间上限，Linux2.4 x86_32
+ * PAGE_OFFSET = 0xC0000000
+ */
+#define TASK_SIZE   (PAGE_OFFSET)
+
 
 /* This decides where the kernel will search for a free chunk of vm
  * space during mmap's.

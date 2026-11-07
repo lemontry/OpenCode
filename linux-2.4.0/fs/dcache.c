@@ -595,54 +595,74 @@ void shrink_dcache_memory(int priority, unsigned int gfp_mask)
  * available. On a success the dentry is returned. The name passed in is
  * copied and the copy passed in may be reused after this call.
  */
- 
+ /**
+ * d_alloc - 分配并初始化一个dentry（目录项缓存对象）
+ * @parent: 父目录dentry，根文件系统顶层dentry传NULL
+ * @name: 文件名qstr（name字符串、长度、hash值）
+ *
+ * 返回：新分配的dentry，失败返回NULL；此时dentry->d_inode = NULL，是未实例化的dentry
+ */
 struct dentry * d_alloc(struct dentry * parent, const struct qstr *name)
 {
-	char * str;
-	struct dentry *dentry;
+    char * str;
+    struct dentry *dentry;
+    // 从dentry专用slab缓存分配dentry结构体本身
+    dentry = kmem_cache_alloc(dentry_cache, GFP_KERNEL);
+    if (!dentry)
+        return NULL;
 
-	dentry = kmem_cache_alloc(dentry_cache, GFP_KERNEL); 
-	if (!dentry)
-		return NULL;
+    // 短名字：直接使用dentry内部内嵌缓冲区 d_iname
+    // 长名字：单独kmalloc堆内存存放名字字符串
+    if (name->len > DNAME_INLINE_LEN-1) {
+        str = kmalloc(NAME_ALLOC_LEN(name->len), GFP_KERNEL);
+        if (!str) {
+            // 名字内存分配失败，回滚，释放刚拿到的dentry
+            kmem_cache_free(dentry_cache, dentry);
+            return NULL;
+        }
+    } else
+        str = dentry->d_iname;
 
-	if (name->len > DNAME_INLINE_LEN-1) {
-		str = kmalloc(NAME_ALLOC_LEN(name->len), GFP_KERNEL);
-		if (!str) {
-			kmem_cache_free(dentry_cache, dentry); 
-			return NULL;
-		}
-	} else
-		str = dentry->d_iname; 
+    // 拷贝文件名，手动追加字符串结束符'\0'
+    memcpy(str, name->name, name->len);
+    str[name->len] = 0;
 
-	memcpy(str, name->name, name->len);
-	str[name->len] = 0;
+    // 初始化引用计数，新建dentry引用计数=1
+    atomic_set(&dentry->d_count, 1);
+    dentry->d_flags = 0;
+    dentry->d_inode = NULL;       // 重点！刚alloc出来，还没有绑定inode
+    dentry->d_parent = NULL;
+    dentry->d_sb = NULL;
+    // 填充d_name（qstr）
+    dentry->d_name.name = str;
+    dentry->d_name.len = name->len;
+    dentry->d_name.hash = name->hash;
 
-	atomic_set(&dentry->d_count, 1);
-	dentry->d_flags = 0;
-	dentry->d_inode = NULL;
-	dentry->d_parent = NULL;
-	dentry->d_sb = NULL;
-	dentry->d_name.name = str;
-	dentry->d_name.len = name->len;
-	dentry->d_name.hash = name->hash;
-	dentry->d_op = NULL;
-	dentry->d_fsdata = NULL;
-	INIT_LIST_HEAD(&dentry->d_vfsmnt);
-	INIT_LIST_HEAD(&dentry->d_hash);
-	INIT_LIST_HEAD(&dentry->d_lru);
-	INIT_LIST_HEAD(&dentry->d_subdirs);
-	INIT_LIST_HEAD(&dentry->d_alias);
-	if (parent) {
-		dentry->d_parent = dget(parent);
-		dentry->d_sb = parent->d_sb;
-		spin_lock(&dcache_lock);
-		list_add(&dentry->d_child, &parent->d_subdirs);
-		spin_unlock(&dcache_lock);
-	} else
-		INIT_LIST_HEAD(&dentry->d_child);
+    dentry->d_op = NULL;          // dentry操作集，可选
+    dentry->d_fsdata = NULL;       // 文件系统私有数据
+    // 初始化各个链表头
+    INIT_LIST_HEAD(&dentry->d_vfsmnt);
+    INIT_LIST_HEAD(&dentry->d_hash);    // dcache哈希表链表
+    INIT_LIST_HEAD(&dentry->d_lru);     // dcache回收LRU链表
+    INIT_LIST_HEAD(&dentry->d_subdirs); // 子dentry链表
+    INIT_LIST_HEAD(&dentry->d_alias);   // 别名链表（一个inode多个dentry硬链接）
 
-	dentry_stat.nr_dentry++;
-	return dentry;
+    if (parent) {
+        // 有父目录：父dentry引用+1
+        dentry->d_parent = dget(parent);
+        // 继承父目录的super_block
+        dentry->d_sb = parent->d_sb;
+        spin_lock(&dcache_lock);
+        // 把当前dentry挂到父的d_subdirs（子目录链表）
+        list_add(&dentry->d_child, &parent->d_subdirs);
+        spin_unlock(&dcache_lock);
+    } else {
+        // parent=NULL：文件系统根dentry（pipefs那个"pipe:"就是这种）
+        INIT_LIST_HEAD(&dentry->d_child);
+    }
+    // 全局统计计数：dentry总数+1
+    dentry_stat.nr_dentry++;
+    return dentry;
 }
 
 /**

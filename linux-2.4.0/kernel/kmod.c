@@ -170,73 +170,88 @@ static int exec_modprobe(void * module_name)
  *	becomes a no-operation.
  */
  
+/**
+ * request_module - 2.4内核kmod机制：内核态按需加载模块
+ * @module_name: 要加载的模块名称
+ *
+ * 作用：内核发现缺少模块时，主动拉起用户态 modprobe 工具加载ko
+ * 典型场景：打开未注册字符设备、挂载文件系统、协议栈缺少驱动
+ */
 int request_module(const char * module_name)
 {
-	pid_t pid;
-	int waitpid_result;
-	sigset_t tmpsig;
-	int i;
-	static atomic_t kmod_concurrent = ATOMIC_INIT(0);
-#define MAX_KMOD_CONCURRENT 50	/* Completely arbitrary value - KAO */
-	static int kmod_loop_msg;
+    pid_t pid;
+    int waitpid_result;
+    sigset_t tmpsig;
+    int i;
+    static atomic_t kmod_concurrent = ATOMIC_INIT(0);
+#define MAX_KMOD_CONCURRENT 50  /* Completely arbitrary value - KAO */
+    static int kmod_loop_msg;
 
-	/* Don't allow request_module() before the root fs is mounted!  */
-	if ( ! current->fs->root ) {
-		printk(KERN_ERR "request_module[%s]: Root fs not mounted\n",
-			module_name);
-		return -EPERM;
-	}
+    // 根文件系统还没挂载，不能拉起用户态modprobe，直接拒绝
+    if ( ! current->fs->root ) {
+        printk(KERN_ERR "request_module[%s]: Root fs not mounted\n",
+            module_name);
+        return -EPERM;
+    }
 
-	/* If modprobe needs a service that is in a module, we get a recursive
-	 * loop.  Limit the number of running kmod threads to max_threads/2 or
-	 * MAX_KMOD_CONCURRENT, whichever is the smaller.  A cleaner method
-	 * would be to run the parents of this process, counting how many times
-	 * kmod was invoked.  That would mean accessing the internals of the
-	 * process tables to get the command line, proc_pid_cmdline is static
-	 * and it is not worth changing the proc code just to handle this case. 
-	 * KAO.
-	 */
-	i = max_threads/2;
-	if (i > MAX_KMOD_CONCURRENT)
-		i = MAX_KMOD_CONCURRENT;
-	atomic_inc(&kmod_concurrent);
-	if (atomic_read(&kmod_concurrent) > i) {
-		if (kmod_loop_msg++ < 5)
-			printk(KERN_ERR
-			       "kmod: runaway modprobe loop assumed and stopped\n");
-		atomic_dec(&kmod_concurrent);
-		return -ENOMEM;
-	}
+    /*
+     * 防递归死循环：
+     * 假设 modprobe 自身依赖某个模块，又触发 request_module，反复嵌套
+     * 限制并发kmod线程数量，取 max_threads/2 和 50 两者较小值
+     */
+    i = max_threads/2;
+    if (i > MAX_KMOD_CONCURRENT)
+        i = MAX_KMOD_CONCURRENT;
 
-	pid = kernel_thread(exec_modprobe, (void*) module_name, 0);
-	if (pid < 0) {
-		printk(KERN_ERR "request_module[%s]: fork failed, errno %d\n", module_name, -pid);
-		atomic_dec(&kmod_concurrent);
-		return pid;
-	}
+    // 并发计数+1
+    atomic_inc(&kmod_concurrent);
+    // 如果当前并发超过上限，判定为循环递归，直接返回
+    if (atomic_read(&kmod_concurrent) > i) {
+        if (kmod_loop_msg++ < 5)
+            printk(KERN_ERR
+                   "kmod: runaway modprobe loop assumed and stopped\n");
+        atomic_dec(&kmod_concurrent);
+        return -ENOMEM;
+    }
 
-	/* Block everything but SIGKILL/SIGSTOP */
-	spin_lock_irq(&current->sigmask_lock);
-	tmpsig = current->blocked;
-	siginitsetinv(&current->blocked, sigmask(SIGKILL) | sigmask(SIGSTOP));
-	recalc_sigpending(current);
-	spin_unlock_irq(&current->sigmask_lock);
+    // 创建内核线程，入口 exec_modprobe，参数是模块名字符串
+    // exec_modprobe 内部会调用 execve 拉起 /sbin/modprobe
+    pid = kernel_thread(exec_modprobe, (void*) module_name, 0);
+    if (pid < 0) {
+        printk(KERN_ERR "request_module[%s]: fork failed, errno %d\n", module_name, -pid);
+        atomic_dec(&kmod_concurrent);
+        return pid;
+    }
 
-	waitpid_result = waitpid(pid, NULL, __WCLONE);
-	atomic_dec(&kmod_concurrent);
+    /*
+     * 信号掩码修改：阻塞除 SIGKILL、SIGSTOP 以外所有信号
+     * 目的：等待modprobe子进程期间，不要被普通信号打断加载流程
+     * 保存原来的信号掩码到 tmpsig，后面恢复
+     */
+    spin_lock_irq(&current->sigmask_lock);
+    tmpsig = current->blocked;
+    siginitsetinv(&current->blocked, sigmask(SIGKILL) | sigmask(SIGSTOP));
+    recalc_sigpending(current);
+    spin_unlock_irq(&current->sigmask_lock);
 
-	/* Allow signals again.. */
-	spin_lock_irq(&current->sigmask_lock);
-	current->blocked = tmpsig;
-	recalc_sigpending(current);
-	spin_unlock_irq(&current->sigmask_lock);
+    // 等待子进程modprobe执行结束，__WCLONE：等待clone出来的轻量进程
+    waitpid_result = waitpid(pid, NULL, __WCLONE);
+    // 并发计数减回
+    atomic_dec(&kmod_concurrent);
 
-	if (waitpid_result != pid) {
-		printk(KERN_ERR "request_module[%s]: waitpid(%d,...) failed, errno %d\n",
-		       module_name, pid, -waitpid_result);
-	}
-	return 0;
+    // 恢复进程原来的信号屏蔽掩码
+    spin_lock_irq(&current->sigmask_lock);
+    current->blocked = tmpsig;
+    recalc_sigpending(current);
+    spin_unlock_irq(&current->sigmask_lock);
+
+    if (waitpid_result != pid) {
+        printk(KERN_ERR "request_module[%s]: waitpid(%d,...) failed, errno %d\n",
+               module_name, pid, -waitpid_result);
+    }
+    return 0;
 }
+
 #endif /* CONFIG_KMOD */
 
 

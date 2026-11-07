@@ -623,27 +623,45 @@ static void clean_inode(struct inode *inode)
  * lists.
  */
  
+/**
+ * get_empty_inode - 获取一个全新空白inode，无关联超级块、无文件信息
+ *
+ * 返回值：成功返回struct inode指针；内存分配失败返回NULL
+ * 说明：分配inode结构体、生成全局唯一inode号、加入inode_in_use链表、初始化引用计数与状态
+ */
 struct inode * get_empty_inode(void)
 {
-	static unsigned long last_ino;
-	struct inode * inode;
+    // 全局静态变量，用来生成自增的inode编号
+    static unsigned long last_ino;
+    struct inode * inode;
 
-	inode = alloc_inode();
-	if (inode)
-	{
-		spin_lock(&inode_lock);
-		inodes_stat.nr_inodes++;
-		list_add(&inode->i_list, &inode_in_use);
-		inode->i_sb = NULL;
-		inode->i_dev = 0;
-		inode->i_ino = ++last_ino;
-		inode->i_flags = 0;
-		atomic_set(&inode->i_count, 1);
-		inode->i_state = 0;
-		spin_unlock(&inode_lock);
-		clean_inode(inode);
-	}
-	return inode;
+    // 从inode缓存分配inode对象
+    inode = alloc_inode();
+    if (inode)
+    {
+        // 加inode全局自旋锁，保护inode链表、统计计数
+        spin_lock(&inode_lock);
+        // 全局inode计数+1
+        inodes_stat.nr_inodes++;
+        // 把这个inode加入【正在使用inode链表】inode_in_use
+        list_add(&inode->i_list, &inode_in_use);
+        // 初始未绑定超级块
+        inode->i_sb = NULL;
+        // 初始设备号置0
+        inode->i_dev = 0;
+        // 分配自增inode号
+        inode->i_ino = ++last_ino;
+        // inode标志清空
+        inode->i_flags = 0;
+        // 引用计数初始化为1，当前持有这一个引用
+        atomic_set(&inode->i_count, 1);
+        // inode状态位清零
+        inode->i_state = 0;
+        spin_unlock(&inode_lock);
+        // 清理inode其余字段，重置为干净初始状态
+        clean_inode(inode);
+    }
+    return inode;
 }
 
 /*
@@ -771,27 +789,45 @@ struct inode *igrab(struct inode *inode)
 }
 
 
+/**
+ * iget4 - 根据superblock和inode号，在inode哈希缓存中查找/分配inode
+ * @sb: 超级块对象
+ * @ino: inode编号
+ * @find_actor: 自定义匹配回调函数
+ * @opaque: 传给find_actor的私有参数
+ *
+ * 返回值：成功返回引用计数+1的inode；失败返回NULL
+ * 说明：先对inode哈希桶加锁，调用find_inode在哈希链表查找；命中则__iget增加引用、等待inode就绪后返回；
+ * 未命中则调用get_new_inode，分配新inode并插入哈希表（内部会防止并发重复创建）。
+ */
 struct inode *iget4(struct super_block *sb, unsigned long ino, find_inode_t find_actor, void *opaque)
 {
-	struct list_head * head = inode_hashtable + hash(sb,ino);
-	struct inode * inode;
+    // 计算哈希桶：inode_hashtable是全局inode哈希表
+    struct list_head * head = inode_hashtable + hash(sb,ino);
+    struct inode * inode;
 
-	spin_lock(&inode_lock);
-	inode = find_inode(sb, ino, head, find_actor, opaque);
-	if (inode) {
-		__iget(inode);
-		spin_unlock(&inode_lock);
-		wait_on_inode(inode);
-		return inode;
-	}
-	spin_unlock(&inode_lock);
+    // 全局inode锁，保护inode哈希表遍历
+    spin_lock(&inode_lock);
+    // 在当前哈希桶链表，使用自定义回调查找inode
+    inode = find_inode(sb, ino, head, find_actor, opaque);
+    if (inode) {
+        // 找到inode，引用计数+1
+        __iget(inode);
+        spin_unlock(&inode_lock);
+        // 等待inode解锁（防止inode处于I/O/脏页等待状态）
+        wait_on_inode(inode);
+        return inode;
+    }
+    spin_unlock(&inode_lock);
 
-	/*
-	 * get_new_inode() will do the right thing, re-trying the search
-	 * in case it had to block at any point.
-	 */
-	return get_new_inode(sb, ino, head, find_actor, opaque);
+    /*
+     * get_new_inode() will do the right thing, re-trying the search
+     * in case it had to block at any point.
+     */
+    // 缓存没命中，分配新inode，内部会再次检查防止并发竞争
+    return get_new_inode(sb, ino, head, find_actor, opaque);
 }
+
 
 /**
  *	insert_inode_hash - hash an inode

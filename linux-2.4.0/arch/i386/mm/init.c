@@ -184,15 +184,25 @@ pgprot_t kmap_prot;
 #define kmap_get_fixmap_pte(vaddr)					\
 	pte_offset(pmd_offset(pgd_offset_k(vaddr), (vaddr)), (vaddr))
 
+/**
+ * kmap_init - 高端内存临时映射区(kmap)初始化函数
+ * __init：初始化函数，内核启动完成后，这段代码内存会被释放
+ * 适用：Linux 2.4 x86 32位，配合HIGHMEM使用
+ * 调用位置：paging_init() 里面，CONFIG_HIGHMEM开启时才会执行
+ */
 void __init kmap_init(void)
 {
-	unsigned long kmap_vstart;
+    unsigned long kmap_vstart;
 
-	/* cache the first kmap pte */
-	kmap_vstart = __fix_to_virt(FIX_KMAP_BEGIN);
-	kmap_pte = kmap_get_fixmap_pte(kmap_vstart);
+    /* cache the first kmap pte */
+    // 拿到FIX_KMAP_BEGIN对应的虚拟地址，kmap固定映射区域的起始虚拟地址
+    kmap_vstart = __fix_to_virt(FIX_KMAP_BEGIN);
+    // 获取这个虚拟地址对应的页表项pte，缓存到全局变量kmap_pte
+    // kmap后续做临时映射，就是修改这一组pte，动态绑定不同的高端物理页
+    kmap_pte = kmap_get_fixmap_pte(kmap_vstart);
 
-	kmap_prot = PAGE_KERNEL;
+    // 设置kmap映射的页表权限：PAGE_KERNEL，内核可读可写，无用户权限
+    kmap_prot = PAGE_KERNEL;
 }
 #endif /* CONFIG_HIGHMEM */
 
@@ -311,107 +321,132 @@ static void __init fixrange_init (unsigned long start, unsigned long end, pgd_t 
 	}
 }
 
+/**
+ * pagetable_init - 初始化内核主页表 swapper_pg_dir，建立内核线性映射，Linux2.4 x86
+ * 调用时机：paging_init 内部，切换cr3之前执行
+ * 无返回值
+ */
 static void __init pagetable_init (void)
 {
-	unsigned long vaddr, end;
-	pgd_t *pgd, *pgd_base;
-	int i, j, k;
-	pmd_t *pmd;
-	pte_t *pte;
+    unsigned long vaddr, end;
+    pgd_t *pgd, *pgd_base;
+    int i, j, k;
+    pmd_t *pmd;
+    pte_t *pte;
 
-	/*
-	 * This can be zero as well - no problem, in that case we exit
-	 * the loops anyway due to the PTRS_PER_* conditions.
-	 */
-	end = (unsigned long)__va(max_low_pfn*PAGE_SIZE);
+    /*
+     * This can be zero as well - no problem, in that case we exit
+     * the loops anyway due to the PTRS_PER_* conditions.
+     */
+    // max_low_pfn：低端内存最大页号，转换成虚拟地址，作为线性映射的结束边界
+    end = (unsigned long)__va(max_low_pfn*PAGE_SIZE);
 
-	pgd_base = swapper_pg_dir;
+    // 内核全局页目录基地址，swapper_pg_dir 是内核初始页表
+    pgd_base = swapper_pg_dir;
 #if CONFIG_X86_PAE
-	for (i = 0; i < PTRS_PER_PGD; i++) {
-		pgd = pgd_base + i;
-		__pgd_clear(pgd);
-	}
+    // PAE模式：先清空所有pgd表项
+    for (i = 0; i < PTRS_PER_PGD; i++) {
+        pgd = pgd_base + i;
+        __pgd_clear(pgd);
+    }
 #endif
-	i = __pgd_offset(PAGE_OFFSET);
-	pgd = pgd_base + i;
+    // PAGE_OFFSET = 0xC0000000，找到内核起始虚拟地址对应的pgd索引
+    i = __pgd_offset(PAGE_OFFSET);
+    pgd = pgd_base + i;
 
-	for (; i < PTRS_PER_PGD; pgd++, i++) {
-		vaddr = i*PGDIR_SIZE;
-		if (end && (vaddr >= end))
-			break;
+    // 遍历内核对应的pgd表项，建立内核线性映射
+    for (; i < PTRS_PER_PGD; pgd++, i++) {
+        vaddr = i*PGDIR_SIZE;
+        // 到达低端内存边界，停止构建映射
+        if (end && (vaddr >= end))
+            break;
 #if CONFIG_X86_PAE
-		pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
-		set_pgd(pgd, __pgd(__pa(pmd) + 0x1));
+        // PAE：分配pmd页，填入pgd
+        pmd = (pmd_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+        set_pgd(pgd, __pgd(__pa(pmd) + 0x1));
 #else
-		pmd = (pmd_t *)pgd;
+        // 非PAE（标准二级页表）：pmd和pgd是同一个，pmd层是虚拟的，PTRS_PER_PMD=1
+        pmd = (pmd_t *)pgd;
 #endif
-		if (pmd != pmd_offset(pgd, 0))
-			BUG();
-		for (j = 0; j < PTRS_PER_PMD; pmd++, j++) {
-			vaddr = i*PGDIR_SIZE + j*PMD_SIZE;
-			if (end && (vaddr >= end))
-				break;
-			if (cpu_has_pse) {
-				unsigned long __pe;
+        if (pmd != pmd_offset(pgd, 0))
+            BUG();
+        // 遍历pmd表项
+        for (j = 0; j < PTRS_PER_PMD; pmd++, j++) {
+            vaddr = i*PGDIR_SIZE + j*PMD_SIZE;
+            if (end && (vaddr >= end))
+                break;
+            // CPU支持PSE大页（4M页），优先使用大页映射
+            if (cpu_has_pse) {
+                unsigned long __pe;
 
-				set_in_cr4(X86_CR4_PSE);
-				boot_cpu_data.wp_works_ok = 1;
-				__pe = _KERNPG_TABLE + _PAGE_PSE + __pa(vaddr);
-				/* Make it "global" too if supported */
-				if (cpu_has_pge) {
-					set_in_cr4(X86_CR4_PGE);
-					__pe += _PAGE_GLOBAL;
-				}
-				set_pmd(pmd, __pmd(__pe));
-				continue;
-			}
+                // 开启CR4的PSE位，允许4M大页
+                set_in_cr4(X86_CR4_PSE);
+                boot_cpu_data.wp_works_ok = 1;
+                // 构造pmd表项：内核属性 + PSE标志 + 物理地址（线性映射 vaddr == __pa(vaddr)）
+                __pe = _KERNPG_TABLE + _PAGE_PSE + __pa(vaddr);
+                // 支持PGE全局页标记，则加上G位，TLB刷新时不刷这个表项
+                if (cpu_has_pge) {
+                    set_in_cr4(X86_CR4_PGE);
+                    __pe += _PAGE_GLOBAL;
+                }
+                set_pmd(pmd, __pmd(__pe));
+                continue;
+            }
 
-			pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
-			set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(pte)));
+            // 不支持PSE，分配pte页，建立4K细粒度页表
+            pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+            set_pmd(pmd, __pmd(_KERNPG_TABLE + __pa(pte)));
 
-			if (pte != pte_offset(pmd, 0))
-				BUG();
+            if (pte != pte_offset(pmd, 0))
+                BUG();
 
-			for (k = 0; k < PTRS_PER_PTE; pte++, k++) {
-				vaddr = i*PGDIR_SIZE + j*PMD_SIZE + k*PAGE_SIZE;
-				if (end && (vaddr >= end))
-					break;
-				*pte = mk_pte_phys(__pa(vaddr), PAGE_KERNEL);
-			}
-		}
-	}
+            // 填充每一个pte，虚拟地址直接映射到相同物理地址（内核线性映射）
+            for (k = 0; k < PTRS_PER_PTE; pte++, k++) {
+                vaddr = i*PGDIR_SIZE + j*PMD_SIZE + k*PAGE_SIZE;
+                if (end && (vaddr >= end))
+                    break;
+                // 构造pte：虚拟地址对应的物理页，权限PAGE_KERNEL（内核读写）
+                *pte = mk_pte_phys(__pa(vaddr), PAGE_KERNEL);
+            }
+        }
+    }
 
-	/*
-	 * Fixed mappings, only the page table structure has to be
-	 * created - mappings will be set by set_fixmap():
-	 */
-	vaddr = __fix_to_virt(__end_of_fixed_addresses - 1) & PMD_MASK;
-	fixrange_init(vaddr, 0, pgd_base);
+    /*
+     * Fixed mappings, only the page table structure has to be
+     * created - mappings will be set by set_fixmap():
+     */
+    // 固定映射区（fixmap）：预先分配页表骨架，后续set_fixmap再填充pte
+    vaddr = __fix_to_virt(__end_of_fixed_addresses - 1) & PMD_MASK;
+    fixrange_init(vaddr, 0, pgd_base);
 
 #if CONFIG_HIGHMEM
-	/*
-	 * Permanent kmaps:
-	 */
-	vaddr = PKMAP_BASE;
-	fixrange_init(vaddr, vaddr + PAGE_SIZE*LAST_PKMAP, pgd_base);
+    /*
+     * Permanent kmaps:
+     */
+    // 高端内存永久映射区PKMAP，预先建好页表框架
+    vaddr = PKMAP_BASE;
+    fixrange_init(vaddr, vaddr + PAGE_SIZE*LAST_PKMAP, pgd_base);
 
-	pgd = swapper_pg_dir + __pgd_offset(vaddr);
-	pmd = pmd_offset(pgd, vaddr);
-	pte = pte_offset(pmd, vaddr);
-	pkmap_page_table = pte;
+    // 保存pkmap页表起始地址，kmap()会使用这个pte数组
+    pgd = swapper_pg_dir + __pgd_offset(vaddr);
+    pmd = pmd_offset(pgd, vaddr);
+    pte = pte_offset(pmd, vaddr);
+    pkmap_page_table = pte;
 #endif
 
 #if CONFIG_X86_PAE
-	/*
-	 * Add low memory identity-mappings - SMP needs it when
-	 * starting up on an AP from real-mode. In the non-PAE
-	 * case we already have these mappings through head.S.
-	 * All user-space mappings are explicitly cleared after
-	 * SMP startup.
-	 */
-	pgd_base[0] = pgd_base[USER_PTRS_PER_PGD];
+    /*
+     * Add low memory identity-mappings - SMP needs it when
+     * starting up on an AP from real-mode. In the non-PAE
+     * case we already have these mappings through head.S.
+     * All user-space mappings are explicitly cleared after
+     * SMP startup.
+     */
+    // PAE模式：给AP启动准备低端物理地址恒等映射（虚拟地址=物理地址）
+    pgd_base[0] = pgd_base[USER_PTRS_PER_PGD];
 #endif
 }
+
 
 void __init zap_low_mappings (void)
 {
@@ -434,6 +469,26 @@ void __init zap_low_mappings (void)
 	flush_tlb_all();
 }
 
+/**
+ * 
+ 物理内存的初始化：
+ start_kernel()
+    ↓
+setup_arch()          //【第一步：识别物理内存】
+    ↓
+paging_init()         //【第二步：页表 + mem_map + zone + 伙伴位图初始化】
+    ↓
+free_area_init()
+    ↓
+free_area_init_core() // 分配mem_map数组、初始化struct page、zone水位、free_area位图
+    ↓
+mem_init()            //【第三步：把空闲物理页释放进伙伴系统buddy】
+    ↓
+free_all_bootmem()
+    ↓
+do_basic_setup()      // 驱动、子系统初始化（你之前看的device_init、chr_dev_init都在这里）
+
+ */
 /*
  * paging_init() sets up the page tables - note that the first 8MB are
  * already mapped by head.S.
@@ -441,47 +496,67 @@ void __init zap_low_mappings (void)
  * This routines also unmaps the page at virtual kernel address 0, so
  * that we can trap those pesky NULL-reference errors in the kernel.
  */
+/**
+ * paging_init - x86 32位页表初始化，建立内核主页表，初始化zone与mem_map，Linux2.4
+ * 调用时机：start_kernel -> setup_arch -> paging_init
+ * 无返回值
+ */
 void __init paging_init(void)
 {
-	pagetable_init();
+    // 初始化swapper_pg_dir内核主页目录（内核初始页表）
+    pagetable_init();
 
-	__asm__( "movl %%ecx,%%cr3\n" ::"c"(__pa(swapper_pg_dir)));
+    // 把swapper_pg_dir物理地址写入cr3，切换到内核页表
+    __asm__( "movl %%ecx,%%cr3\n" ::"c"(__pa(swapper_pg_dir)));
 
 #if CONFIG_X86_PAE
-	/*
-	 * We will bail out later - printk doesnt work right now so
-	 * the user would just see a hanging kernel.
-	 */
-	if (cpu_has_pae)
-		set_in_cr4(X86_CR4_PAE);
+    /*
+     * We will bail out later - printk doesnt work right now so
+     * the user would just see a hanging kernel.
+     */
+    // 如果CPU支持PAE，开启CR4的PAE位，启用36位物理地址扩展
+    if (cpu_has_pae)
+        set_in_cr4(X86_CR4_PAE);
 #endif
 
-	__flush_tlb_all();
+    // 刷新全部TLB，使新页表生效
+    __flush_tlb_all();
 
 #ifdef CONFIG_HIGHMEM
-	kmap_init();
+    // 高端内存初始化：kmap/kunmap、pkmap页表
+    kmap_init();
 #endif
-	{
-		unsigned long zones_size[MAX_NR_ZONES] = {0, 0, 0};
-		unsigned int max_dma, high, low;
+    {
+        // 各个zone的页框数量数组：ZONE_DMA、ZONE_NORMAL、ZONE_HIGHMEM
+        unsigned long zones_size[MAX_NR_ZONES] = {0, 0, 0};
+        unsigned int max_dma, high, low;
 
-		max_dma = virt_to_phys((char *)MAX_DMA_ADDRESS) >> PAGE_SHIFT;
-		low = max_low_pfn;
-		high = highend_pfn;
+        // MAX_DMA_ADDRESS对应的物理页号，ZONE_DMA上限
+        max_dma = virt_to_phys((char *)MAX_DMA_ADDRESS) >> PAGE_SHIFT;
+        // low：ZONE_NORMAL的末尾pfn（低于__PAGE_OFFSET的最大页号）
+        low = max_low_pfn;
+        // high：整个物理内存的最大pfn
+        high = highend_pfn;
 
-		if (low < max_dma)
-			zones_size[ZONE_DMA] = low;
-		else {
-			zones_size[ZONE_DMA] = max_dma;
-			zones_size[ZONE_NORMAL] = low - max_dma;
+        // 内存全部在DMA区域内
+        if (low < max_dma)
+            zones_size[ZONE_DMA] = low;
+        else {
+            // DMA区域：0 ~ max_dma
+            zones_size[ZONE_DMA] = max_dma;
+            // NORMAL区域：max_dma ~ max_low_pfn
+            zones_size[ZONE_NORMAL] = low - max_dma;
 #ifdef CONFIG_HIGHMEM
-			zones_size[ZONE_HIGHMEM] = high - low;
+            // HIGHMEM区域：max_low_pfn ~ highend_pfn（没有线性映射）
+            zones_size[ZONE_HIGHMEM] = high - low;
 #endif
-		}
-		free_area_init(zones_size);
-	}
-	return;
+        }
+        // 核心：初始化zone、分配mem_map数组、初始化所有struct page
+        free_area_init(zones_size);
+    }
+    return;
 }
+
 
 /*
  * Test if the WP bit works in supervisor mode. It isn't supported on 386's
@@ -551,80 +626,121 @@ static inline int page_is_ram (unsigned long pagenr)
 	return 0;
 }
 
+/**
+ * mem_init - 内存管理初始化收尾函数
+ * __init：初始化函数，执行完成后该段代码占用内存后续可以释放
+ * 调用时机：start_kernel() 中，paging_init、free_area_init 之后
+ * 核心作用：
+ * 1. 设定全局内存边界变量
+ * 2. 清零零页 empty_zero_page
+ * 3. 把 bootmem 管理的低端内存释放到伙伴系统 free_area
+ * 4. 处理高端内存 page 标记、释放进伙伴系统
+ * 5. 统计内核代码/数据/init段大小、打印内存信息
+ * 6. 可选：销毁低端页表映射、检测CPU WP位、PAE合法性检查
+ *
+ * 时序重点：
+ * free_area_init_core 只是搭建zone、伙伴系统链表框架；
+ * mem_init 才真正把空闲物理页交到伙伴系统，此后alloc_pages才可以正常分配内存
+ */
 void __init mem_init(void)
 {
-	int codesize, reservedpages, datasize, initsize;
-	int tmp;
+    int codesize, reservedpages, datasize, initsize;
+    int tmp;
 
-	if (!mem_map)
-		BUG();
+    // 合法性检查：mem_map 必须已经分配好，是所有物理页struct page数组
+    if (!mem_map)
+        BUG();
 
 #ifdef CONFIG_HIGHMEM
-	highmem_start_page = mem_map + highstart_pfn;
-	max_mapnr = num_physpages = highend_pfn;
+    // 开启高端内存：highmem_start_page 指向高端内存第一个page描述符
+    highmem_start_page = mem_map + highstart_pfn;
+    // max_mapnr：最大有效页帧号；num_physpages：整机物理总页数；highend_pfn是最高pfn
+    max_mapnr = num_physpages = highend_pfn;
 #else
-	max_mapnr = num_physpages = max_low_pfn;
+    // 无HIGHMEM，全部是低端内存，上限就是max_low_pfn
+    max_mapnr = num_physpages = max_low_pfn;
 #endif
-	high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
+    // high_memory：低端内存线性映射区的虚拟地址上限（__va转换，896M边界）
+    high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
 
-	/* clear the zero-page */
-	memset(empty_zero_page, 0, PAGE_SIZE);
+    /* clear the zero-page */
+    // 清零全局零页，匿名缺页、COW时会用到ZERO_PAGE
+    memset(empty_zero_page, 0, PAGE_SIZE);
 
-	/* this will put all low memory onto the freelists */
-	totalram_pages += free_all_bootmem();
+    /* this will put all low memory onto the freelists */
+    // free_all_bootmem：遍历bootmem位图，把bootmem里标记空闲的低端页释放进伙伴系统
+    // 返回释放的页数，累加到总可用内存 totalram_pages
+    totalram_pages += free_all_bootmem();
 
-	reservedpages = 0;
-	for (tmp = 0; tmp < max_low_pfn; tmp++)
-		/*
-		 * Only count reserved RAM pages
-		 */
-		if (page_is_ram(tmp) && PageReserved(mem_map+tmp))
-			reservedpages++;
+    reservedpages = 0;
+    // 遍历全部低端内存pfn，统计【属于RAM、并且标记为Reserved保留】的页面数量
+    // Reserved页：内核镜像、内核数据、BIOS、设备占用等，不允许伙伴系统分配
+    for (tmp = 0; tmp < max_low_pfn; tmp++)
+        /*
+         * Only count reserved RAM pages
+         */
+        if (page_is_ram(tmp) && PageReserved(mem_map+tmp))
+            reservedpages++;
+
 #ifdef CONFIG_HIGHMEM
-	for (tmp = highstart_pfn; tmp < highend_pfn; tmp++) {
-		struct page *page = mem_map + tmp;
+    // 遍历所有高端内存pfn
+    for (tmp = highstart_pfn; tmp < highend_pfn; tmp++) {
+        struct page *page = mem_map + tmp;
 
-		if (!page_is_ram(tmp)) {
-			SetPageReserved(page);
-			continue;
-		}
-		ClearPageReserved(page);
-		set_bit(PG_highmem, &page->flags);
-		atomic_set(&page->count, 1);
-		__free_page(page);
-		totalhigh_pages++;
-	}
-	totalram_pages += totalhigh_pages;
+        // 不是有效RAM的页，标记为保留页，不参与分配
+        if (!page_is_ram(tmp)) {
+            SetPageReserved(page);
+            continue;
+        }
+        // 有效RAM：清除保留标记
+        ClearPageReserved(page);
+        // 打上PG_highmem标志，标记这是高端内存页
+        set_bit(PG_highmem, &page->flags);
+        // 引用计数初始化为1
+        atomic_set(&page->count, 1);
+        // 把高端页释放进伙伴系统free_area
+        __free_page(page);
+        // 高端内存页数统计
+        totalhigh_pages++;
+    }
+    // 高端页计入总内存
+    totalram_pages += totalhigh_pages;
 #endif
-	codesize =  (unsigned long) &_etext - (unsigned long) &_text;
-	datasize =  (unsigned long) &_edata - (unsigned long) &_etext;
-	initsize =  (unsigned long) &__init_end - (unsigned long) &__init_begin;
 
-	printk("Memory: %luk/%luk available (%dk kernel code, %dk reserved, %dk data, %dk init, %ldk highmem)\n",
-		(unsigned long) nr_free_pages() << (PAGE_SHIFT-10),
-		max_mapnr << (PAGE_SHIFT-10),
-		codesize >> 10,
-		reservedpages << (PAGE_SHIFT-10),
-		datasize >> 10,
-		initsize >> 10,
-		(unsigned long) (totalhigh_pages << (PAGE_SHIFT-10))
-	       );
+    // 计算内核各段大小（虚拟地址，链接脚本符号）
+    codesize =  (unsigned long) &_etext - (unsigned long) &_text;    // .text 代码段大小
+    datasize =  (unsigned long) &_edata - (unsigned long) &_etext;    // .data 初始化数据段大小
+    initsize =  (unsigned long) &__init_end - (unsigned long) &__init_begin; // __init段大小
+
+    // 打印内核启动内存信息，就是dmesg里看到的Memory: xxx available
+    printk("Memory: %luk/%luk available (%dk kernel code, %dk reserved, %dk data, %dk init, %ldk highmem)\n",
+        (unsigned long) nr_free_pages() << (PAGE_SHIFT-10),    // 当前空闲页数
+        max_mapnr << (PAGE_SHIFT-10),                         // 整机物理内存总大小
+        codesize >> 10,                                       // 内核代码 KB
+        reservedpages << (PAGE_SHIFT-10),                     // 保留页 KB
+        datasize >> 10,                                       // data段 KB
+        initsize >> 10,                                       // init段 KB
+        (unsigned long) (totalhigh_pages << (PAGE_SHIFT-10))  // highmem 总大小 KB
+        );
 
 #if CONFIG_X86_PAE
-	if (!cpu_has_pae)
-		panic("cannot execute a PAE-enabled kernel on a PAE-less CPU!");
+    // 开启PAE内核，但是CPU不支持PAE，直接panic崩溃
+    if (!cpu_has_pae)
+        panic("cannot execute a PAE-enabled kernel on a PAE-less CPU!");
 #endif
-	if (boot_cpu_data.wp_works_ok < 0)
-		test_wp_bit();
+    // 测试CPU的WP写保护位是否正常
+    if (boot_cpu_data.wp_works_ok < 0)
+        test_wp_bit();
 
-	/*
-	 * Subtle. SMP is doing it's boot stuff late (because it has to
-	 * fork idle threads) - but it also needs low mappings for the
-	 * protected-mode entry to work. We zap these entries only after
-	 * the WP-bit has been tested.
-	 */
+    /*
+     * Subtle. SMP is doing it's boot stuff late (because it has to
+     * fork idle threads) - but it also needs low mappings for the
+     * protected-mode entry to work. We zap these entries only after
+     * the WP-bit has been tested.
+     */
 #ifndef CONFIG_SMP
-	zap_low_mappings();
+    // 非SMP：销毁低端临时页表映射，节省页表资源；SMP需要保留低端映射给AP启动，所以不执行
+    zap_low_mappings();
 #endif
 
 }

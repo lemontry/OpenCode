@@ -84,19 +84,20 @@ typedef unsigned long sigset_t;
  * SA_ONESHOT and SA_NOMASK are the historical Linux names for the Single
  * Unix names RESETHAND and NODEFER respectively.
  */
-#define SA_NOCLDSTOP	0x00000001
-#define SA_NOCLDWAIT	0x00000002 /* not supported yet */
-#define SA_SIGINFO	0x00000004
-#define SA_ONSTACK	0x08000000
-#define SA_RESTART	0x10000000
-#define SA_NODEFER	0x40000000
-#define SA_RESETHAND	0x80000000
+// 信号处理动作标志，用于sigaction结构体的sa_flags字段
+#define SA_NOCLDSTOP    0x00000001 // 子进程停止时，不向父进程发送SIGCHLD
+#define SA_NOCLDWAIT    0x00000002 // 子进程退出不转为僵尸进程，2.4内核暂未支持
+#define SA_SIGINFO      0x00000004 // 使用带附加信息的信号处理函数(siginfo_t)
+#define SA_ONSTACK      0x08000000 // 在信号备用栈(alt stack)上执行信号处理函数
+#define SA_RESTART      0x10000000 // 信号中断系统调用后，自动重启该系统调用
+#define SA_NODEFER      0x40000000 // 信号处理执行期间，不阻塞当前信号
+#define SA_RESETHAND    0x80000000 // 信号处理函数执行一次后，重置为默认处理方式
 
-#define SA_NOMASK	SA_NODEFER
-#define SA_ONESHOT	SA_RESETHAND
-#define SA_INTERRUPT	0x20000000 /* dummy -- ignored */
+#define SA_NOMASK       SA_NODEFER // 别名，同SA_NODEFER，老名字
+#define SA_ONESHOT      SA_RESETHAND // 别名，同SA_RESETHAND，老名字
+#define SA_INTERRUPT    0x20000000 // 占位标志，内核直接忽略，无实际作用
 
-#define SA_RESTORER	0x04000000
+#define SA_RESTORER     0x04000000 // 提供自定义信号返回恢复函数，glibc内部使用
 
 /* 
  * sigaltstack controls
@@ -116,9 +117,10 @@ typedef unsigned long sigset_t;
  * SA_INTERRUPT is also used by the irq handling routines.
  * SA_SHIRQ is for shared interrupt support on PCI and EISA.
  */
-#define SA_PROBE		SA_ONESHOT
-#define SA_SAMPLE_RANDOM	SA_RESTART
-#define SA_SHIRQ		0x04000000
+// irqaction 中断注册标志位（request_irq的irqflags参数，注意：和信号sigaction的SA_xxx不是同一套！）
+#define SA_PROBE            SA_ONESHOT       // 探测模式，复用SA_ONESHOT值，中断探测时使用
+#define SA_SAMPLE_RANDOM    SA_RESTART       // 利用该中断的发生时间，向内核随机熵池注入随机数据
+#define SA_SHIRQ            0x04000000       // 共享中断标志：多个设备可以共用同一个IRQ号
 #endif
 
 #define SIG_BLOCK          0	/* for blocking signals */

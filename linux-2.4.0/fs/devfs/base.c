@@ -1230,141 +1230,180 @@ static void devfsd_notify (struct devfs_entry *de, unsigned int type, int wait)
  *	Returns a handle which may later be used in a call to devfs_unregister().
  *	On failure %NULL is returned.
  */
-
-devfs_handle_t devfs_register (devfs_handle_t dir, const char *name,
-			       unsigned int flags,
-			       unsigned int major, unsigned int minor,
-			       umode_t mode, void *ops, void *info)
+/**
+ * devfs_register - 在devfs文件系统注册一个设备节点
+ * @dir: 父目录句柄，传入NULL代表devfs根目录
+ * @name: 节点名称字符串
+ * @flags: devfs注册控制标志
+ * @major: 主设备号
+ * @minor: 次设备号
+ * @mode: 文件类型+权限掩码
+ * @ops: 文件操作集合 file_operations*
+ * @info: 节点私有附属信息
+ * 返回值：成功返回devfs_entry句柄devfs_handle_t；失败返回NULL
+ */
+devfs_handle_t devfs_register(devfs_handle_t dir, const char *name,
+                              unsigned int flags,
+                              unsigned int major, unsigned int minor,
+                              umode_t mode, void *ops, void *info)
 {
     int is_new;
     struct devfs_entry *de;
 
+    // 节点名字指针为空，打印日志直接返回失败
     if (name == NULL)
     {
-	printk ("%s: devfs_register(): NULL name pointer\n", DEVFS_NAME);
-	return NULL;
+        printk("%s: devfs_register(): NULL name pointer\n", DEVFS_NAME);
+        return NULL;
     }
+    // ops为空时的兜底处理
     if (ops == NULL)
     {
-	if ( S_ISBLK (mode) ) ops = (void *) get_blkfops (major);
-	if (ops == NULL)
-	{
-	    printk ("%s: devfs_register(%s): NULL ops pointer\n",
-		    DEVFS_NAME, name);
-	    return NULL;
-	}
-	printk ("%s: devfs_register(%s): NULL ops, got %p from major table\n",
-		DEVFS_NAME, name, ops);
+        // 如果是块设备，从全局块设备表获取fops
+        if (S_ISBLK(mode))
+            ops = (void *)get_blkfops(major);
+        // 仍然拿不到ops，报错返回
+        if (ops == NULL)
+        {
+            printk("%s: devfs_register(%s): NULL ops pointer\n",
+                   DEVFS_NAME, name);
+            return NULL;
+        }
+        printk("%s: devfs_register(%s): NULL ops, got %p from major table\n",
+               DEVFS_NAME, name, ops);
     }
-    if ( S_ISDIR (mode) )
+    // 该接口不允许创建目录
+    if (S_ISDIR(mode))
     {
-	printk("%s: devfs_register(%s): creating directories is not allowed\n",
-	       DEVFS_NAME, name);
-	return NULL;
+        printk("%s: devfs_register(%s): creating directories is not allowed\n",
+               DEVFS_NAME, name);
+        return NULL;
     }
-    if ( S_ISLNK (mode) )
+    // 该接口不允许创建符号链接
+    if (S_ISLNK(mode))
     {
-	printk ("%s: devfs_register(%s): creating symlinks is not allowed\n",
-		DEVFS_NAME, name);
-	return NULL;
+        printk("%s: devfs_register(%s): creating symlinks is not allowed\n",
+               DEVFS_NAME, name);
+        return NULL;
     }
-    if ( S_ISCHR (mode) && (flags & DEVFS_FL_AUTO_DEVNUM) )
+    // 字符设备，开启自动分配设备号标记
+    if (S_ISCHR(mode) && (flags & DEVFS_FL_AUTO_DEVNUM))
     {
-	if (next_devnum_char >= MAX_DEVNUM)
-	{
-	    printk ("%s: devfs_register(%s): exhausted char device numbers\n",
-		    DEVFS_NAME, name);
-	    return NULL;
-	}
-	major = next_devnum_char >> 8;
-	minor = next_devnum_char & 0xff;
-	++next_devnum_char;
+        if (next_devnum_char >= MAX_DEVNUM)
+        {
+            printk("%s: devfs_register(%s): exhausted char device numbers\n",
+                   DEVFS_NAME, name);
+            return NULL;
+        }
+        major = next_devnum_char >> 8;
+        minor = next_devnum_char & 0xff;
+        ++next_devnum_char;
     }
-    if ( S_ISBLK (mode) && (flags & DEVFS_FL_AUTO_DEVNUM) )
+    // 块设备，开启自动分配设备号标记
+    if (S_ISBLK(mode) && (flags & DEVFS_FL_AUTO_DEVNUM))
     {
-	if (next_devnum_block >= MAX_DEVNUM)
-	{
-	    printk ("%s: devfs_register(%s): exhausted block device numbers\n",
-		    DEVFS_NAME, name);
-	    return NULL;
-	}
-	major = next_devnum_block >> 8;
-	minor = next_devnum_block & 0xff;
-	++next_devnum_block;
+        if (next_devnum_block >= MAX_DEVNUM)
+        {
+            printk("%s: devfs_register(%s): exhausted block device numbers\n",
+                   DEVFS_NAME, name);
+            return NULL;
+        }
+        major = next_devnum_block >> 8;
+        minor = next_devnum_block & 0xff;
+        ++next_devnum_block;
     }
-    de = search_for_entry (dir, name, strlen (name), TRUE, TRUE, &is_new,
-			   FALSE);
+    // 查找或者新建devfs目录项entry
+    de = search_for_entry(dir, name, strlen(name), TRUE, TRUE, &is_new,
+                          FALSE);
     if (de == NULL)
     {
-	printk ("%s: devfs_register(): could not create entry: \"%s\"\n",
-		DEVFS_NAME, name);
-	return NULL;
+        printk("%s: devfs_register(): could not create entry: \"%s\"\n",
+               DEVFS_NAME, name);
+        return NULL;
     }
 #ifdef CONFIG_DEVFS_DEBUG
     if (devfs_debug & DEBUG_REGISTER)
-	printk ("%s: devfs_register(%s): de: %p %s\n",
-		DEVFS_NAME, name, de, is_new ? "new" : "existing");
+        printk("%s: devfs_register(%s): de: %p %s\n",
+               DEVFS_NAME, name, de, is_new ? "new" : "existing");
 #endif
+    // 节点已经存在的校验分支
     if (!is_new)
     {
-	/*  Existing entry  */
-	if ( !S_ISCHR (de->mode) && !S_ISBLK (de->mode) &&
-	     !S_ISREG (de->mode) )
-	{
-	    printk ("%s: devfs_register(): existing non-device/file entry: \"%s\"\n",
-		    DEVFS_NAME, name);
-	    return NULL;
-	}
-	if (de->registered)
-	{
-	    printk("%s: devfs_register(): device already registered: \"%s\"\n",
-		   DEVFS_NAME, name);
-	    return NULL;
-	}
+        /*  Existing entry  */
+        // 已存在节点不是设备/普通文件类型，非法
+        if (!S_ISCHR(de->mode) && !S_ISBLK(de->mode) &&
+            !S_ISREG(de->mode))
+        {
+            printk("%s: devfs_register(): existing non-device/file entry: \"%s\"\n",
+                   DEVFS_NAME, name);
+            return NULL;
+        }
+        // 节点已经注册过，禁止重复注册
+        if (de->registered)
+        {
+            printk("%s: devfs_register(): device already registered: \"%s\"\n",
+                   DEVFS_NAME, name);
+            return NULL;
+        }
     }
+    // 标记entry为已注册
     de->registered = TRUE;
-    if ( S_ISCHR (mode) || S_ISBLK (mode) )
+    // 字符/块设备：回填主次设备号
+    if (S_ISCHR(mode) || S_ISBLK(mode))
     {
-	de->u.fcb.u.device.major = major;
-	de->u.fcb.u.device.minor = minor;
+        de->u.fcb.u.device.major = major;
+        de->u.fcb.u.device.minor = minor;
     }
-    else if ( S_ISREG (mode) ) de->u.fcb.u.file.size = 0;
+    // 普通文件，初始化size为0
+    else if (S_ISREG(mode))
+        de->u.fcb.u.file.size = 0;
     else
     {
-	printk ("%s: devfs_register(): illegal mode: %x\n",
-		DEVFS_NAME, mode);
-	return (NULL);
+        printk("%s: devfs_register(): illegal mode: %x\n",
+               DEVFS_NAME, mode);
+        return (NULL);
     }
+    // 设置私有信息指针
     de->info = info;
+    // 设置文件mode（类型+权限）
     de->mode = mode;
+    // DEVFS_FL_CURRENT_OWNER：属主设置为当前进程uid/gid
     if (flags & DEVFS_FL_CURRENT_OWNER)
     {
-	de->u.fcb.default_uid = current->uid;
-	de->u.fcb.default_gid = current->gid;
+        de->u.fcb.default_uid = current->uid;
+        de->u.fcb.default_gid = current->gid;
     }
     else
     {
-	de->u.fcb.default_uid = 0;
-	de->u.fcb.default_gid = 0;
+        // 默认属主root(0,0)
+        de->u.fcb.default_uid = 0;
+        de->u.fcb.default_gid = 0;
     }
     de->registered = TRUE;
+    // 绑定文件操作函数集
     de->u.fcb.ops = ops;
+    // 自动属主标记
     de->u.fcb.auto_owner = (flags & DEVFS_FL_AUTO_OWNER) ? TRUE : FALSE;
+    // 异步打开通知标记
     de->u.fcb.aopen_notify = (flags & DEVFS_FL_AOPEN_NOTIFY) ? TRUE : FALSE;
+    // 可移除设备标记，父目录可移除计数+1
     if (flags & DEVFS_FL_REMOVABLE)
     {
-	de->u.fcb.removable = TRUE;
-	++de->parent->u.dir.num_removable;
+        de->u.fcb.removable = TRUE;
+        ++de->parent->u.dir.num_removable;
     }
+    // 标记当前设备未打开
     de->u.fcb.open = FALSE;
-    de->show_unreg = ( (boot_options & OPTION_SHOW)
-			|| (flags & DEVFS_FL_SHOW_UNREG) ) ? TRUE : FALSE;
+    // 卸载后是否保留展示
+    de->show_unreg = ((boot_options & OPTION_SHOW) || (flags & DEVFS_FL_SHOW_UNREG)) ? TRUE : FALSE;
+    // 隐藏节点标记
     de->hide = (flags & DEVFS_FL_HIDE) ? TRUE : FALSE;
+    // 关闭持久化标记
     de->no_persistence = (flags & DEVFS_FL_NO_PERSISTENCE) ? TRUE : FALSE;
-    devfsd_notify (de, DEVFSD_NOTIFY_REGISTERED, flags & DEVFS_FL_WAIT);
+    // 通知用户态devfsd守护进程：设备注册事件
+    devfsd_notify(de, DEVFSD_NOTIFY_REGISTERED, flags & DEVFS_FL_WAIT);
     return de;
-}   /*  End Function devfs_register  */
-
+} /*  End Function devfs_register  */
 
 /**
  *	unregister - Unregister a device entry.

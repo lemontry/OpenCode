@@ -19,11 +19,21 @@ typedef struct poll_table_struct {
 
 extern void __pollwait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p);
 
+/**
+ * poll_wait - poll机制辅助封装函数（Linux2.4）
+ * @filp: 待监听的文件对象
+ * @wait_address: 等待队列头，要把进程挂到这个等待队列上
+ * @p: poll_table，poll的上下文控制结构
+ * 作用：条件满足时调用__pollwait，把当前进程的等待节点加入等待队列
+ * 注意：本函数**不会让进程休眠**，仅仅是登记等待队列
+ */
 extern inline void poll_wait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
 {
-	if (p && wait_address)
-		__pollwait(filp, wait_address, p);
+    // 合法性判断：poll_table 和等待队列头都不为空才执行
+    if (p && wait_address)
+        __pollwait(filp, wait_address, p);
 }
+
 
 static inline void poll_initwait(poll_table* pt)
 {

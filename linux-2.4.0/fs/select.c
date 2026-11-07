@@ -70,37 +70,55 @@ void poll_freewait(poll_table* pt)
 		free_page((unsigned long) old);
 	}
 }
-
+/**
+ * __pollwait - poll_wait 的底层实现，向poll_table中添加等待节点（Linux2.4）
+ * @filp: 文件对象
+ * @wait_address: 等待队列头，进程要挂载到这个队列
+ * @p: poll_table，本次poll调用的上下文
+ * 作用：分配poll表页、创建poll_table_entry，把等待节点加入等待队列
+ */
 void __pollwait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
 {
-	struct poll_table_page *table = p->table;
-
-	if (!table || POLL_TABLE_FULL(table)) {
-		struct poll_table_page *new_table;
-
-		new_table = (struct poll_table_page *) __get_free_page(GFP_KERNEL);
-		if (!new_table) {
-			p->error = -ENOMEM;
-			__set_current_state(TASK_RUNNING);
-			return;
-		}
-		new_table->entry = new_table->entries;
-		new_table->next = table;
-		p->table = new_table;
-		table = new_table;
-	}
-
-	/* Add a new entry */
-	{
-		struct poll_table_entry * entry = table->entry;
-		table->entry = entry+1;
-	 	get_file(filp);
-	 	entry->filp = filp;
-		entry->wait_address = wait_address;
-		init_waitqueue_entry(&entry->wait, current);
-		add_wait_queue(wait_address,&entry->wait);
-	}
+    // 取出poll_table当前正在使用的poll_table_page页
+    struct poll_table_page *table = p->table;
+    // 判断：没有页 或者 当前页已经存满poll条目
+    if (!table || POLL_TABLE_FULL(table)) {
+        struct poll_table_page *new_table;
+        // 申请一页内核页，GFP_KERNEL：允许睡眠分配内存
+        new_table = (struct poll_table_page *) __get_free_page(GFP_KERNEL);
+        // 内存分配失败
+        if (!new_table) {
+            p->error = -ENOMEM;
+            // 恢复进程运行态，防止异常休眠
+            __set_current_state(TASK_RUNNING);
+            return;
+        }
+        // 新页的entry指针指向条目数组起始位置
+        new_table->entry = new_table->entries;
+        // 新页的next挂到老页头部，形成链表（头插）
+        new_table->next = table;
+        // poll_table切换到新分配的页
+        p->table = new_table;
+        table = new_table;
+    }
+    /* Add a new entry */
+    {
+        // 取当前空闲的poll_table_entry条目
+        struct poll_table_entry * entry = table->entry;
+        // 指针后移，标记下一个空闲位置
+        table->entry = entry+1;
+        // 增加file引用计数，防止poll等待期间文件被close释放
+        get_file(filp);
+        // 填充条目：关联file和等待队列头
+        entry->filp = filp;
+        entry->wait_address = wait_address;
+        // 初始化等待节点，绑定当前进程current
+        init_waitqueue_entry(&entry->wait, current);
+        // 将等待节点挂载到目标等待队列
+        add_wait_queue(wait_address,&entry->wait);
+    }
 }
+
 
 #define __IN(fds, n)		(fds->in + n)
 #define __OUT(fds, n)		(fds->out + n)

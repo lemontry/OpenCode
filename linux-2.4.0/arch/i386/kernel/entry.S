@@ -98,6 +98,7 @@ ENOSYS = 38
 	movl %edx,%ds; \
 	movl %edx,%es;
 
+# 恢复各种寄存器
 #define RESTORE_ALL	\
 	popl %ebx;	\
 	popl %ecx;	\
@@ -275,6 +276,7 @@ ret_from_exception:
 #endif
 	jne   handle_softirq
 
+# ret_from_intr**已经删掉了中断返回路径上的软中断检查**
 ENTRY(ret_from_intr)
 	GET_CURRENT(%ebx)
 	movl EFLAGS(%esp),%eax		# mix EFLAGS and CS
@@ -284,6 +286,8 @@ ENTRY(ret_from_intr)
 	jmp restore_all
 
 	ALIGN
+
+# 系统调用返回，异常返回，调用  handle_softirq
 handle_softirq:
 	call SYMBOL_NAME(do_softirq)
 	jmp ret_from_intr
@@ -293,37 +297,49 @@ reschedule:
 	call SYMBOL_NAME(schedule)    # test
 	jmp ret_from_sys_call
 
+# 在原始线程栈上面操作（没有准备异常栈）
 ENTRY(divide_error)
 	pushl $0		# no error code
 	pushl $ SYMBOL_NAME(do_divide_error)
 	ALIGN
+/**
+ * error_code: Linux2.4 x86，CPU异常公共跳板汇编入口
+ * 用途：所有CPU异常（int3、缺页#PF、GP#GP等）共用这个公共框架
+ * 前面 int3 / page_fault 这类入口，都会预先压入【错误码】+【C处理函数地址】，然后jmp到这里
+ * 核心工作：
+ * 1. 保存所有通用寄存器，在栈上构建 struct pt_regs 完整栈帧
+ * 2. 切换段寄存器到内核段
+ * 3. 取出预先压入的C异常处理函数地址，调用C函数
+ * 4. C函数返回后，跳转到 ret_from_exception 做异常返回收尾
+ */
 error_code:
-	pushl %ds
-	pushl %eax
-	xorl %eax,%eax
-	pushl %ebp
-	pushl %edi
-	pushl %esi
-	pushl %edx
-	decl %eax			# eax = -1
-	pushl %ecx
-	pushl %ebx
-	cld
-	movl %es,%ecx
-	movl ORIG_EAX(%esp), %esi	# get the error code
-	movl ES(%esp), %edi		# get the function address
-	movl %eax, ORIG_EAX(%esp)
-	movl %ecx, ES(%esp)
-	movl %esp,%edx
-	pushl %esi			# push the error code
-	pushl %edx			# push the pt_regs pointer
-	movl $(__KERNEL_DS),%edx
-	movl %edx,%ds
-	movl %edx,%es
-	GET_CURRENT(%ebx)
-	call *%edi
-	addl $8,%esp
-	jmp ret_from_exception
+	pushl %ds                // 保存原ds段选择子
+	pushl %eax               // 暂存eax
+	xorl %eax,%eax           // eax清零
+	pushl %ebp               // 保存ebp
+	pushl %edi               // 保存edi
+	pushl %esi               // 保存esi
+	pushl %edx               // 保存edx
+	decl %eax		         // eax = -1，标记这是异常（不是系统调用）
+	pushl %ecx               // 保存ecx
+	pushl %ebx               // 保存ebx
+	cld                      // 清除方向标志，字符串指令向前增长
+	movl %es,%ecx            // 把es段寄存器读到ecx
+	movl ORIG_EAX(%esp), %esi	// 从栈取出【错误码】放到esi
+	movl ES(%esp), %edi		    // 从栈取出【C处理函数地址】放到edi
+	movl %eax, ORIG_EAX(%esp)  // ORIG_EAX 位置写入-1：标记本次是异常，不是系统调用
+	movl %ecx, ES(%esp)        // 将es保存到栈帧ES位置
+	movl %esp,%edx             // edx = 当前栈指针，就是pt_regs结构体的起始地址
+	pushl %esi		         // 参数2：压入错误码
+	pushl %edx		         // 参数1：压入pt_regs指针（C函数第一个参数）
+	movl $(__KERNEL_DS),%edx  // 加载内核数据段选择子
+	movl %edx,%ds             // ds切换到内核数据段
+	movl %edx,%es             // es切换到内核数据段
+	GET_CURRENT(%ebx)         // GET_CURRENT宏：用gs寄存器拿到当前task_struct指针，存入ebx
+	call *%edi                // 间接调用：edi里面就是do_int3 / do_page_fault 这类C异常处理函数
+	addl $8,%esp              // 清理栈上两个入参（pt_regs指针 + error_code），平衡栈
+	jmp ret_from_exception    // 跳到异常返回公共代码，不再回来
+
 
 ENTRY(coprocessor_error)
 	pushl $0
@@ -364,9 +380,9 @@ ENTRY(nmi)
 	RESTORE_ALL
 
 ENTRY(int3)
-	pushl $0
-	pushl $ SYMBOL_NAME(do_int3)
-	jmp error_code
+	pushl $0                 // 压入错误码0；int3断点异常没有硬件错误码
+	pushl $ SYMBOL_NAME(do_int3) // 压入C处理函数 do_int3 的地址, DO_VM86_ERROR( 3, SIGTRAP, "int3", int3) 实现，最终都是 do_trap实现
+	jmp error_code           // 跳转到公共异常处理入口 error_code
 
 ENTRY(overflow)
 	pushl $0

@@ -34,15 +34,24 @@ int last_pid;
 
 struct task_struct *pidhash[PIDHASH_SZ];
 
+/**
+ * add_wait_queue - 将等待节点加入等待队列头（加到链表头部） Linux2.4
+ * @q: 等待队列头
+ * @wait: 待加入的等待节点 wait_queue_t
+ */
 void add_wait_queue(wait_queue_head_t *q, wait_queue_t * wait)
 {
-	unsigned long flags;
-
-	wq_write_lock_irqsave(&q->lock, flags);
-	wait->flags = 0;
-	__add_wait_queue(q, wait);
-	wq_write_unlock_irqrestore(&q->lock, flags);
+    // 保存当前中断标志，并获取等待队列的读写锁（写锁）
+    unsigned long flags;
+    wq_write_lock_irqsave(&q->lock, flags);
+    // 清空节点flags标记
+    wait->flags = 0;
+    // 底层链表操作：把wait节点插入task_list链表头部
+    __add_wait_queue(q, wait);
+    // 释放写锁，恢复之前保存的中断标志
+    wq_write_unlock_irqrestore(&q->lock, flags);
 }
+
 
 void add_wait_queue_exclusive(wait_queue_head_t *q, wait_queue_t * wait)
 {

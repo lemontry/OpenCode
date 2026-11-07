@@ -10,21 +10,32 @@
 
 #define MAX_SWAPFILES 8
 
+/**
+ * union swap_header - swap分区头部描述，位于swap设备第一页，识别swap元信息，Linux2.4
+ */
 union swap_header {
-	struct 
-	{
-		char reserved[PAGE_SIZE - 10];
-		char magic[10];
-	} magic;
-	struct 
-	{
-		char	     bootbits[1024];	/* Space for disklabel etc. */
-		unsigned int version;
-		unsigned int last_page;
-		unsigned int nr_badpages;
-		unsigned int padding[125];
-		unsigned int badpages[1];
-	} info;
+    struct 
+    {
+        // 保留区域
+        char reserved[PAGE_SIZE - 10];
+        // swap魔数字符串，用于识别swap分区
+        char magic[10];
+    } magic;
+    struct 
+    {
+        // 留给磁盘标签、分区表等引导数据
+        char         bootbits[1024];    /* Space for disklabel etc. */
+        // swap版本号
+        unsigned int version;
+        // swap分区最后一个有效页号
+        unsigned int last_page;
+        // 坏页数量
+        unsigned int nr_badpages;
+        // 填充对齐
+        unsigned int padding[125];
+        // 可变长度坏页数组，存放坏页页号
+        unsigned int badpages[1];
+    } info;
 };
 
 #ifdef __KERNEL__
@@ -46,21 +57,38 @@ union swap_header {
 #define SWAP_MAP_MAX	0x7fff
 #define SWAP_MAP_BAD	0x8000
 
+/**
+ * swap_info_struct - 交换分区/交换文件描述结构，管理一个swap设备，Linux2.4
+ */
 struct swap_info_struct {
-	unsigned int flags;
-	kdev_t swap_device;
-	spinlock_t sdev_lock;
-	struct dentry * swap_file;
-	struct vfsmount *swap_vfsmnt;
-	unsigned short * swap_map;
-	unsigned int lowest_bit;
-	unsigned int highest_bit;
-	unsigned int cluster_next;
-	unsigned int cluster_nr;
-	int prio;			/* swap priority */
-	int pages;
-	unsigned long max;
-	int next;			/* next entry on swap list */
+    // swap设备状态标志
+    unsigned int flags;
+    // 交换设备的设备号
+    kdev_t swap_device;
+    // 保护本swap结构的自旋锁
+    spinlock_t sdev_lock;
+    // 交换文件对应的dentry（swap文件时使用）
+    struct dentry * swap_file;
+    // 交换文件所在文件系统挂载点
+    struct vfsmount *swap_vfsmnt;
+    // swap槽位图，每个元素记录一个swap槽的引用计数
+    unsigned short * swap_map;
+    // 第一个可用swap槽索引
+    unsigned int lowest_bit;
+    // 最后一个可用swap槽索引
+    unsigned int highest_bit;
+    // 预读簇下一个位置
+    unsigned int cluster_next;
+    // 当前预读簇剩余页数
+    unsigned int cluster_nr;
+    // swap优先级，数值越大优先级越高
+    int prio;           /* swap priority */
+    // 有效swap总页数
+    int pages;
+    // swap槽最大索引
+    unsigned long max;
+    // swap链表下一项下标
+    int next;           /* next entry on swap list */
 };
 
 extern int nr_swap_pages;

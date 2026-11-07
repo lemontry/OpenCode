@@ -38,15 +38,22 @@
 
 /* IP Hooks */
 /* After promisc drops, checksum checks. */
+// 混杂模式丢包、校验和检查完成之后，路由之前
 #define NF_IP_PRE_ROUTING	0
 /* If the packet is destined for this box. */
+// 报文目的地是本机，路由查找完成后
 #define NF_IP_LOCAL_IN		1
 /* If the packet is destined for another interface. */
+// 报文需要转发到别的网卡
 #define NF_IP_FORWARD		2
 /* Packets coming from a local process. */
+// 本机进程发出的报文
 #define NF_IP_LOCAL_OUT		3
 /* Packets about to hit the wire. */
+// 报文即将发送到网卡硬件之前
 #define NF_IP_POST_ROUTING	4
+
+// IPv4钩子点总数量
 #define NF_IP_NUMHOOKS		5
 
 enum nf_ip_hook_priorities {

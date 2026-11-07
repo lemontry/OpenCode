@@ -71,6 +71,8 @@
 	ipc_checkid(&sem_ids,&sma->sem_perm,semid)
 #define sem_buildid(id, seq) \
 	ipc_buildid(&sem_ids, id, seq)
+
+//信号量的管理结构
 static struct ipc_ids sem_ids;
 
 static int newary (key_t, int, int);
@@ -109,77 +111,126 @@ void __init sem_init (void)
 #endif
 }
 
+/**
+ * newary - 创建一个新的System V信号量集合，sys_semget创建分支调用
+ * @key: IPC key
+ * @nsems: 集合内信号量个数
+ * @semflg: IPC标志+权限位
+ * return: 成功返回组装后的semid；失败返回负错误码
+ * 
+ struct sem_array
++----------------------------+
+| sem_perm、sem_nsems、时间等 |
++----------------------------+
+| struct sem[0]              |
+| struct sem[1]              |
+| ...                        |
+| struct sem[nsems-1]        |
++----------------------------+
+
+ */
 static int newary (key_t key, int nsems, int semflg)
 {
-	int id;
-	struct sem_array *sma;
-	int size;
+    int id;
+    struct sem_array *sma;
+    int size;
 
-	if (!nsems)
-		return -EINVAL;
-	if (used_sems + nsems > sc_semmns)
-		return -ENOSPC;
+    // 信号量数量不能为0
+    if (!nsems)
+        return -EINVAL;
+    // 全局信号量总数上限校验：used_sems 是当前系统所有sem累加计数
+    if (used_sems + nsems > sc_semmns)
+        return -ENOSPC;
 
-	size = sizeof (*sma) + nsems * sizeof (struct sem);
-	sma = (struct sem_array *) ipc_alloc(size);
-	if (!sma) {
-		return -ENOMEM;
-	}
-	memset (sma, 0, size);
-	id = ipc_addid(&sem_ids, &sma->sem_perm, sc_semmni);
-	if(id == -1) {
-		ipc_free(sma, size);
-		return -ENOSPC;
-	}
-	used_sems += nsems;
+    // 内存大小 = sem_array管理头 + nsems个struct sem
+    size = sizeof (*sma) + nsems * sizeof (struct sem);
+    // ipc_alloc：IPC专用内存分配，和kmalloc类似
+    sma = (struct sem_array *) ipc_alloc(size);
+    if (!sma) {
+        return -ENOMEM;
+    }
+    // 整块清零
+    memset (sma, 0, size);
+    // 分配sem_ids数组下标id，初始化sma->sem_perm（生成seq序列号）
+    id = ipc_addid(&sem_ids, &sma->sem_perm, sc_semmni);
+    if(id == -1) {
+        ipc_free(sma, size);
+        return -ENOSPC;
+    }
+    // 全局信号量计数累加
+    used_sems += nsems;
 
-	sma->sem_perm.mode = (semflg & S_IRWXUGO);
-	sma->sem_perm.key = key;
+    // 设置权限mode、IPC key
+    sma->sem_perm.mode = (semflg & S_IRWXUGO);
+    sma->sem_perm.key = key;
 
-	sma->sem_base = (struct sem *) &sma[1];
-	/* sma->sem_pending = NULL; */
-	sma->sem_pending_last = &sma->sem_pending;
-	/* sma->undo = NULL; */
-	sma->sem_nsems = nsems;
-	sma->sem_ctime = CURRENT_TIME;
-	sem_unlock(id);
+    // sem_base：信号量数组起始地址，紧跟在sem_array结构体后面
+    sma->sem_base = (struct sem *) &sma[1];
+    /* sma->sem_pending = NULL; */
+    sma->sem_pending_last = &sma->sem_pending;
+    /* sma->undo = NULL; */
+    // 这个信号量集里面有多少个信号量
+    sma->sem_nsems = nsems;
+    // 创建时间
+    sma->sem_ctime = CURRENT_TIME;
+    // ipc_addid内部会上锁，这里释放细粒度自旋锁
+    sem_unlock(id);
 
-	return sem_buildid(id, sma->sem_perm.seq);
+    // 合成对外给用户的semid：下标id + seq序列号
+    return sem_buildid(id, sma->sem_perm.seq);
 }
 
+/**
+ * sys_semget - System V信号量集创建/查找系统调用
+ * @key: IPC键，IPC_PRIVATE代表私有信号量集
+ * @nsems: 信号量集中包含信号量的个数
+ * @semflg: IPC_CREAT / IPC_EXCL / 权限位
+ * return: 成功返回semid；失败返回负错误码
+ */
 asmlinkage long sys_semget (key_t key, int nsems, int semflg)
 {
-	int id, err = -EINVAL;
-	struct sem_array *sma;
+    int id, err = -EINVAL;
+    struct sem_array *sma;
 
-	if (nsems < 0 || nsems > sc_semmsl)
-		return -EINVAL;
-	down(&sem_ids.sem);
-	
-	if (key == IPC_PRIVATE) {
-		err = newary(key, nsems, semflg);
-	} else if ((id = ipc_findkey(&sem_ids, key)) == -1) {  /* key not used */
-		if (!(semflg & IPC_CREAT))
-			err = -ENOENT;
-		else
-			err = newary(key, nsems, semflg);
-	} else if (semflg & IPC_CREAT && semflg & IPC_EXCL) {
-		err = -EEXIST;
-	} else {
-		sma = sem_lock(id);
-		if(sma==NULL)
-			BUG();
-		if (nsems > sma->sem_nsems)
-			err = -EINVAL;
-		else if (ipcperms(&sma->sem_perm, semflg))
-			err = -EACCES;
-		else
-			err = sem_buildid(id, sma->sem_perm.seq);
-		sem_unlock(id);
-	}
+    // 校验信号量数量：不能小于0，不能超过系统上限sc_semmsl
+    if (nsems < 0 || nsems > sc_semmsl)
+        return -EINVAL;
+    // 全局信号量IPC粗粒度锁，保证查找+创建原子化
+    down(&sem_ids.sem);
+    
+    if (key == IPC_PRIVATE) {
+        // IPC_PRIVATE：直接新建，不做key查找
+        err = newary(key, nsems, semflg);
+    } else if ((id = ipc_findkey(&sem_ids, key)) == -1) {  /* key not used */
+        // 根据key查找，没有找到
+        if (!(semflg & IPC_CREAT))
+            // 不要求创建，直接返回不存在
+            err = -ENOENT;
+        else
+            // 创建新的信号量数组
+            err = newary(key, nsems, semflg);
+    } else if (semflg & IPC_CREAT && semflg & IPC_EXCL) {
+        // IPC_CREAT | IPC_EXCL：要求新建，但key已经存在，返回-EEXIST
+        err = -EEXIST;
+    } else {
+        // key找到已有信号量集，复用
+        sma = sem_lock(id);
+        if(sma==NULL)
+            BUG();
+        // 已有信号量集的信号量个数不能小于用户传入nsems
+        if (nsems > sma->sem_nsems)
+            err = -EINVAL;
+        else if (ipcperms(&sma->sem_perm, semflg))
+            // IPC权限校验失败
+            err = -EACCES;
+        else
+            // 组装对外的semid（下标 + seq序列号）
+            err = sem_buildid(id, sma->sem_perm.seq);
+        sem_unlock(id);
+    }
 
-	up(&sem_ids.sem);
-	return err;
+    up(&sem_ids.sem);
+    return err;
 }
 
 /* doesn't acquire the sem_lock on error! */
@@ -238,64 +289,91 @@ static inline void remove_from_queue (struct sem_array * sma,
  * all at once. Return 0 if yes, 1 if need to sleep, else return error code.
  */
 
+/**
+ * try_atomic_semop - 尝试原子执行一组System V信号量操作
+ * @sma: 信号量集合描述符
+ * @sops: 待执行的sembuf操作数组
+ * @nsops: 操作的数量
+ * @un: sem_undo撤销结构，用于记录SEM_UNDO补偿值
+ * @pid: 当前进程pid
+ * @do_undo: 是否需要回滚（本次只是预检查，先不真正提交）
+ * 返回值：0 全部操作成功；1 需要阻塞；负数为错误码
+ * 功能：按原子语义尝试批量执行信号量操作，只要任意一条操作不满足条件，全部回滚
+ */
 static int try_atomic_semop (struct sem_array * sma, struct sembuf * sops,
-			     int nsops, struct sem_undo *un, int pid,
-			     int do_undo)
+                     int nsops, struct sem_undo *un, int pid,
+                     int do_undo)
 {
-	int result, sem_op;
-	struct sembuf *sop;
-	struct sem * curr;
+    int result, sem_op;
+    struct sembuf *sop;
+    struct sem * curr;
 
-	for (sop = sops; sop < sops + nsops; sop++) {
-		curr = sma->sem_base + sop->sem_num;
-		sem_op = sop->sem_op;
+    // 遍历每一条信号量操作
+    for (sop = sops; sop < sops + nsops; sop++) {
+        // 定位当前操作对应的信号量对象
+        curr = sma->sem_base + sop->sem_num;
+        sem_op = sop->sem_op;
 
-		if (!sem_op && curr->semval)
-			goto would_block;
+        // sem_op等于0，代表等待信号量值为0；当前semval不为0，条件不满足
+        if (!sem_op && curr->semval)
+            goto would_block;
 
-		curr->sempid = (curr->sempid << 16) | pid;
-		curr->semval += sem_op;
-		if (sop->sem_flg & SEM_UNDO)
-			un->semadj[sop->sem_num] -= sem_op;
+        // 更新最后操作该信号量的pid信息
+        curr->sempid = (curr->sempid << 16) | pid;
+        // 先应用本次操作，修改semval
+        curr->semval += sem_op;
+        // 如果带SEM_UNDO标记，更新undo补偿值（退出时反向恢复）
+        if (sop->sem_flg & SEM_UNDO)
+            un->semadj[sop->sem_num] -= sem_op;
 
-		if (curr->semval < 0)
-			goto would_block;
-		if (curr->semval > SEMVMX)
-			goto out_of_range;
-	}
+        // 信号量值小于0，资源不足，需要阻塞
+        if (curr->semval < 0)
+            goto would_block;
+        // 信号量值超过上限SEMVMX，越界
+        if (curr->semval > SEMVMX)
+            goto out_of_range;
+    }
 
-	if (do_undo)
-	{
-		sop--;
-		result = 0;
-		goto undo;
-	}
+    // do_undo标记置位：代表本次只是试探，成功后也要回滚，不持久生效
+    if (do_undo)
+    {
+        sop--;
+        result = 0;
+        goto undo;
+    }
 
-	sma->sem_otime = CURRENT_TIME;
-	return 0;
+    // 全部操作成功，更新信号量集合最后操作时间
+    sma->sem_otime = CURRENT_TIME;
+    return 0;
 
 out_of_range:
-	result = -ERANGE;
-	goto undo;
+    // 信号量数值超出合法范围，错误ERANGE
+    result = -ERANGE;
+    goto undo;
 
 would_block:
-	if (sop->sem_flg & IPC_NOWAIT)
-		result = -EAGAIN;
-	else
-		result = 1;
+    // 条件不满足，判断是否非阻塞
+    if (sop->sem_flg & IPC_NOWAIT)
+        result = -EAGAIN;
+    else
+        result = 1;
 
 undo:
-	while (sop >= sops) {
-		curr = sma->sem_base + sop->sem_num;
-		curr->semval -= sop->sem_op;
-		curr->sempid >>= 16;
+    // 回滚分支：反向撤销已经执行过的操作，保证整组操作原子性
+    while (sop >= sops) {
+        curr = sma->sem_base + sop->sem_num;
+        // 恢复semval原值
+        curr->semval -= sop->sem_op;
+        // 恢复sempid
+        curr->sempid >>= 16;
 
-		if (sop->sem_flg & SEM_UNDO)
-			un->semadj[sop->sem_num] += sop->sem_op;
-		sop--;
-	}
+        // 同步撤销undo结构里面的补偿记录
+        if (sop->sem_flg & SEM_UNDO)
+            un->semadj[sop->sem_num] += sop->sem_op;
+        sop--;
+    }
 
-	return result;
+    return result;
 }
 
 /* Go through the pending queue for the indicated semaphore
@@ -738,42 +816,56 @@ out_unlock:
 	return err;
 }
 
+/**
+ * sys_semctl - System V信号量集控制系统调用
+ * @semid: 信号量集id
+ * @semnum: 信号量集中的索引（针对单个sem操作时使用）
+ * @cmd: 控制命令
+ * @arg: union semun，命令配套参数
+ * return: 成功根据命令返回对应值；失败返回负错误码
+ */
 asmlinkage long sys_semctl (int semid, int semnum, int cmd, union semun arg)
 {
-	int err = -EINVAL;
-	int version;
+    int err = -EINVAL;
+    int version;
 
-	if (semid < 0)
-		return -EINVAL;
+    if (semid < 0)
+        return -EINVAL;
 
-	version = ipc_parse_version(&cmd);
+    // 解析IPC版本，兼容新旧IPC结构体布局
+    version = ipc_parse_version(&cmd);
 
-	switch(cmd) {
-	case IPC_INFO:
-	case SEM_INFO:
-	case SEM_STAT:
-		err = semctl_nolock(semid,semnum,cmd,version,arg);
-		return err;
-	case GETALL:
-	case GETVAL:
-	case GETPID:
-	case GETNCNT:
-	case GETZCNT:
-	case IPC_STAT:
-	case SETVAL:
-	case SETALL:
-		err = semctl_main(semid,semnum,cmd,version,arg);
-		return err;
-	case IPC_RMID:
-	case IPC_SET:
-		down(&sem_ids.sem);
-		err = semctl_down(semid,semnum,cmd,version,arg);
-		up(&sem_ids.sem);
-		return err;
-	default:
-		return -EINVAL;
-	}
+    switch(cmd) {
+    case IPC_INFO:
+    case SEM_INFO:
+    case SEM_STAT:
+        // 全局信息查询、遍历查询，不需要拿sem_ids.sem粗锁
+        err = semctl_nolock(semid,semnum,cmd,version,arg);
+        return err;
+    case GETALL:
+    case GETVAL:
+    case GETPID:
+    case GETNCNT:
+    case GETZCNT:
+    case IPC_STAT:
+    case SETVAL:
+    case SETALL:
+        // 读写信号量值、状态、设置值；内部仅使用sem_lock细自旋锁
+        err = semctl_main(semid,semnum,cmd,version,arg);
+        return err;
+    case IPC_RMID:
+    case IPC_SET:
+        // 修改类操作：删除信号量集 / 修改IPC权限uid/gid/mode
+        // 需要全局粗锁 sem_ids.sem 保证原子
+        down(&sem_ids.sem);
+        err = semctl_down(semid,semnum,cmd,version,arg);
+        up(&sem_ids.sem);
+        return err;
+    default:
+        return -EINVAL;
+    }
 }
+
 
 static struct sem_undo* freeundos(struct sem_array *sma, struct sem_undo* un)
 {
@@ -793,174 +885,224 @@ static struct sem_undo* freeundos(struct sem_array *sma, struct sem_undo* un)
 }
 
 /* returns without sem_lock on error! */
+/**
+ * alloc_undo - 分配并初始化一个sem_undo撤销结构
+ * @sma: 信号量集合对象
+ * @unp: 出参，成功时返回分配好的sem_undo结构体指针
+ * @semid: 信号量集合id
+ * @alter: 标记本次操作是否会修改信号量值（写操作）
+ * 返回值：成功返回0，失败返回负错误码
+ * 功能：SEM_UNDO机制底层，创建undo节点，同时挂入进程链表、信号量集合undo链表
+ */
 static int alloc_undo(struct sem_array *sma, struct sem_undo** unp, int semid, int alter)
 {
-	int size, nsems, error;
-	struct sem_undo *un;
+    int size, nsems, error;
+    struct sem_undo *un;
 
-	nsems = sma->sem_nsems;
-	size = sizeof(struct sem_undo) + sizeof(short)*nsems;
-	sem_unlock(semid);
+    // 获取该信号量集合内信号量的数量
+    nsems = sma->sem_nsems;
+    // 计算总大小：结构体本身 + semadj数组（每个信号量一个short记录撤销增量）
+    size = sizeof(struct sem_undo) + sizeof(short)*nsems;
+    // 释放信号量集合的锁
+    sem_unlock(semid);
 
-	un = (struct sem_undo *) kmalloc(size, GFP_KERNEL);
-	if (!un)
-		return -ENOMEM;
+    // kmalloc分配undo结构内存
+    un = (struct sem_undo *) kmalloc(size, GFP_KERNEL);
+    if (!un)
+        return -ENOMEM;
 
-	memset(un, 0, size);
-	error = sem_revalidate(semid, sma, nsems, alter ? S_IWUGO : S_IRUGO);
-	if(error) {
-		kfree(un);
-		return error;
-	}
+    // 整块内存清零初始化
+    memset(un, 0, size);
+    // 重新校验进程对该信号量集合的权限
+    error = sem_revalidate(semid, sma, nsems, alter ? S_IWUGO : S_IRUGO);
+    if(error) {
+        // 权限校验失败，释放内存返回错误
+        kfree(un);
+        return error;
+    }
 
-	un->semadj = (short *) &un[1];
-	un->semid = semid;
-	un->proc_next = current->semundo;
-	current->semundo = un;
-	un->id_next = sma->undo;
-	sma->undo = un;
-	*unp = un;
-	return 0;
+    // semadj数组放在sem_undo结构体后面（柔性数组方式）
+    un->semadj = (short *) &un[1];
+    // 绑定所属信号量id
+    un->semid = semid;
+    // 插入到当前进程的semundo链表头部（进程维度链表）
+    un->proc_next = current->semundo;
+    current->semundo = un;
+    // 插入到信号量集合sma的undo链表头部（信号量集合维度链表）
+    un->id_next = sma->undo;
+    sma->undo = un;
+    // 回填出参，把新建undo结构返回给调用方
+    *unp = un;
+    return 0;
 }
 
+/**
+ * sys_semop - System V信号量集semop系统调用，执行一组信号量操作（原子批操作）
+ * @semid: 信号量集ID
+ * @tsops: 用户态 struct sembuf 数组起始地址
+ * @nsops: 本次要执行多少条sem操作
+ * return: 成功返回0；失败返回负错误码
+ */
 asmlinkage long sys_semop (int semid, struct sembuf *tsops, unsigned nsops)
 {
-	int error = -EINVAL;
-	struct sem_array *sma;
-	struct sembuf fast_sops[SEMOPM_FAST];
-	struct sembuf* sops = fast_sops, *sop;
-	struct sem_undo *un;
-	int undos = 0, decrease = 0, alter = 0;
-	struct sem_queue queue;
+    int error = -EINVAL;
+    struct sem_array *sma;
+    struct sembuf fast_sops[SEMOPM_FAST];
+    struct sembuf* sops = fast_sops, *sop;
+    struct sem_undo *un;
+    int undos = 0, decrease = 0, alter = 0;
+    struct sem_queue queue;
 
-	if (nsops < 1 || semid < 0)
-		return -EINVAL;
-	if (nsops > sc_semopm)
-		return -E2BIG;
-	if(nsops > SEMOPM_FAST) {
-		sops = kmalloc(sizeof(*sops)*nsops,GFP_KERNEL);
-		if(sops==NULL)
-			return -ENOMEM;
-	}
-	if (copy_from_user (sops, tsops, nsops * sizeof(*tsops))) {
-		error=-EFAULT;
-		goto out_free;
-	}
-	sma = sem_lock(semid);
-	error=-EINVAL;
-	if(sma==NULL)
-		goto out_free;
-	error = -EIDRM;
-	if (sem_checkid(sma,semid))
-		goto out_unlock_free;
-	error = -EFBIG;
-	for (sop = sops; sop < sops + nsops; sop++) {
-		if (sop->sem_num >= sma->sem_nsems)
-			goto out_unlock_free;
-		if (sop->sem_flg & SEM_UNDO)
-			undos++;
-		if (sop->sem_op < 0)
-			decrease = 1;
-		if (sop->sem_op > 0)
-			alter = 1;
-	}
-	alter |= decrease;
+    // 参数合法性检查：操作数至少1个，semid不能为负
+    if (nsops < 1 || semid < 0)
+        return -EINVAL;
+    // 超过系统单次semop最大操作条数 sc_semopm
+    if (nsops > sc_semopm)
+        return -E2BIG;
+    // 小操作数走栈上fast缓冲区，避免kmalloc；大操作数动态分配
+    if(nsops > SEMOPM_FAST) {
+        sops = kmalloc(sizeof(*sops)*nsops,GFP_KERNEL);
+        if(sops==NULL)
+            return -ENOMEM;
+    }
+    // 把用户态sembuf数组拷贝到内核缓冲区
+    if (copy_from_user (sops, tsops, nsops * sizeof(*tsops))) {
+        error=-EFAULT;
+        goto out_free;
+    }
+    // 获取信号量集对象 + 持有细粒度自旋锁
+    sma = sem_lock(semid);
+    error=-EINVAL;
+    if(sma==NULL)
+        goto out_free;
+    // 校验semid序列号，防止已经销毁复用id（-EIDRM）
+    error = -EIDRM;
+    if (sem_checkid(sma,semid))
+        goto out_unlock_free;
+    error = -EFBIG;
+    // 遍历所有操作，预处理标记：
+    // undos：是否有操作带SEM_UNDO；decrease：有没有sem_op<0（P操作，减）；alter：是否修改信号量
+    for (sop = sops; sop < sops + nsops; sop++) {
+        if (sop->sem_num >= sma->sem_nsems)
+            goto out_unlock_free;
+        if (sop->sem_flg & SEM_UNDO)
+            undos++;
+        if (sop->sem_op < 0)
+            decrease = 1;
+        if (sop->sem_op > 0)
+            alter = 1;
+    }
+    alter |= decrease;
 
-	error = -EACCES;
-	if (ipcperms(&sma->sem_perm, alter ? S_IWUGO : S_IRUGO))
-		goto out_unlock_free;
-	if (undos) {
-		/* Make sure we have an undo structure
-		 * for this process and this semaphore set.
-		 */
-		un=current->semundo;
-		while(un != NULL) {
-			if(un->semid==semid)
-				break;
-			if(un->semid==-1)
-				un=freeundos(sma,un);
-			 else
-				un=un->proc_next;
-		}
-		if (!un) {
-			error = alloc_undo(sma,&un,semid,alter);
-			if(error)
-				goto out_free;
-		}
-	} else
-		un = NULL;
+    // IPC权限校验：写操作需要S_IWUGO，只读（sem_op=0等待0）只需要S_IRUGO
+    error = -EACCES;
+    if (ipcperms(&sma->sem_perm, alter ? S_IWUGO : S_IRUGO))
+        goto out_unlock_free;
+    if (undos) {
+        /* Make sure we have an undo structure
+         * for this process and this semaphore set.
+         */
+        // 存在SEM_UNDO，查找当前进程绑定这个sem集的sem_undo节点
+        un=current->semundo;
+        while(un != NULL) {
+            if(un->semid==semid)
+                break;
+            if(un->semid==-1)
+                un=freeundos(sma,un);
+             else
+                un=un->proc_next;
+        }
+        // 没有找到就分配新的sem_undo，用于进程退出时回滚信号量
+        if (!un) {
+            error = alloc_undo(sma,&un,semid,alter);
+            if(error)
+                goto out_free;
+        }
+    } else
+        un = NULL;
 
-	error = try_atomic_semop (sma, sops, nsops, un, current->pid, 0);
-	if (error <= 0)
-		goto update;
+    // 尝试原子执行这一批sem操作，非阻塞尝试
+    // error <=0：成功或者遇到直接返回的错误；error>0：条件不满足，需要阻塞睡眠
+    error = try_atomic_semop (sma, sops, nsops, un, current->pid, 0);
+    if (error <= 0)
+        goto update;
 
-	/* We need to sleep on this operation, so we put the current
-	 * task into the pending queue and go to sleep.
-	 */
-		
-	queue.sma = sma;
-	queue.sops = sops;
-	queue.nsops = nsops;
-	queue.undo = un;
-	queue.pid = current->pid;
-	queue.alter = decrease;
-	queue.id = semid;
-	if (alter)
-		append_to_queue(sma ,&queue);
-	else
-		prepend_to_queue(sma ,&queue);
-	current->semsleeping = &queue;
+    /* We need to sleep on this operation, so we put the current
+     * task into the pending queue and go to sleep.
+     */
+    // 条件不满足，构造sem_queue等待节点，加入sem的pending等待链表
+    queue.sma = sma;
+    queue.sops = sops;
+    queue.nsops = nsops;
+    queue.undo = un;
+    queue.pid = current->pid;
+    queue.alter = decrease;
+    queue.id = semid;
+    // 会修改信号量的操作放队尾；纯等待（sem_op=0）插到队头，优先级更高
+    if (alter)
+        append_to_queue(sma ,&queue);
+    else
+        prepend_to_queue(sma ,&queue);
+    current->semsleeping = &queue;
 
-	for (;;) {
-		struct sem_array* tmp;
-		queue.status = -EINTR;
-		queue.sleeper = current;
-		current->state = TASK_INTERRUPTIBLE;
-		sem_unlock(semid);
+    // 睡眠循环，可中断 TASK_INTERRUPTIBLE，可以被信号唤醒
+    for (;;) {
+        struct sem_array* tmp;
+        queue.status = -EINTR;
+        queue.sleeper = current;
+        current->state = TASK_INTERRUPTIBLE;
+        // 放锁，睡眠前释放自旋锁，避免阻塞其他sem操作
+        sem_unlock(semid);
 
-		schedule();
+        schedule();
 
-		tmp = sem_lock(semid);
-		if(tmp==NULL) {
-			if(queue.status != -EIDRM)
-				BUG();
-			current->semsleeping = NULL;
-			error = -EIDRM;
-			goto out_free;
-		}
-		/*
-		 * If queue.status == 1 we where woken up and
-		 * have to retry else we simply return.
-		 * If an interrupt occurred we have to clean up the
-		 * queue
-		 *
-		 */
-		if (queue.status == 1)
-		{
-			error = try_atomic_semop (sma, sops, nsops, un,
-						  current->pid,0);
-			if (error <= 0) 
-				break;
-		} else {
-			error = queue.status;
-			if (queue.prev) /* got Interrupt */
-				break;
-			/* Everything done by update_queue */
-			current->semsleeping = NULL;
-			goto out_unlock_free;
-		}
-	}
-	current->semsleeping = NULL;
-	remove_from_queue(sma,&queue);
+        // 被唤醒之后，重新拿锁检查sem集是否还存在
+        tmp = sem_lock(semid);
+        if(tmp==NULL) {
+            if(queue.status != -EIDRM)
+                BUG();
+            current->semsleeping = NULL;
+            error = -EIDRM;
+            goto out_free;
+        }
+        /*
+         * If queue.status == 1 we where woken up and
+         * have to retry else we simply return.
+         * If an interrupt occurred we have to clean up the
+         * queue
+         *
+         */
+        // status==1：被别的V操作唤醒，重新尝试执行semop
+        if (queue.status == 1)
+        {
+            error = try_atomic_semop (sma, sops, nsops, un,
+                    current->pid,0);
+            if (error <= 0) 
+                break;
+        } else {
+            // 信号打断、或者被删除，直接返回状态
+            error = queue.status;
+            if (queue.prev) /* got Interrupt */
+                break;
+            /* Everything done by update_queue */
+            current->semsleeping = NULL;
+            goto out_unlock_free;
+        }
+    }
+    current->semsleeping = NULL;
+    // 成功执行，把自己从pending等待链表移除
+    remove_from_queue(sma,&queue);
 update:
-	if (alter)
-		update_queue (sma);
+    // 如果本次操作修改了信号量的值，调用update_queue唤醒等待链表上能满足条件的进程
+    if (alter)
+        update_queue (sma);
 out_unlock_free:
-	sem_unlock(semid);
+    sem_unlock(semid);
 out_free:
-	if(sops != fast_sops)
-		kfree(sops);
-	return error;
+    // 如果不是栈上fast buffer，释放kmalloc内存
+    if(sops != fast_sops)
+        kfree(sops);
+    return error;
 }
 
 /*

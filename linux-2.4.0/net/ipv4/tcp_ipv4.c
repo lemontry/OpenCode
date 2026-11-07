@@ -1890,45 +1890,67 @@ struct tcp_func ipv4_specific = {
 /* NOTE: A lot of things set to zero explicitly by call to
  *       sk_alloc() so need not be done here.
  */
+/**
+ * tcp_v4_init_sock - IPv4版本TCP的sock初始化函数，proto->init回调
+ * @sk: 传输控制块
+ *
+ * 返回值：成功返回0
+ * 说明：分配sk之后，TCP协议专属初始化，初始化tcp_opt拥塞、定时器、队列、窗口参数
+ */
 static int tcp_v4_init_sock(struct sock *sk)
 {
-	struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
+    // 获取TCP私有控制块tcp_opt
+    struct tcp_opt *tp = &(sk->tp_pinfo.af_tcp);
 
-	skb_queue_head_init(&tp->out_of_order_queue);
-	tcp_init_xmit_timers(sk);
-	tcp_prequeue_init(tp);
+    // 初始化乱序报文队列（收到失序skb暂存在这里）
+    skb_queue_head_init(&tp->out_of_order_queue);
+    // 初始化TCP全部定时器：重传定时器、保活定时器、延迟ACK定时器等
+    tcp_init_xmit_timers(sk);
+    // 初始化TCP预队列（prequeue，软中断收到包先放这里，进程上下文优先消费）
+    tcp_prequeue_init(tp);
 
-	tp->rto  = TCP_TIMEOUT_INIT;
-	tp->mdev = TCP_TIMEOUT_INIT;
-      
-	/* So many TCP implementations out there (incorrectly) count the
-	 * initial SYN frame in their delayed-ACK and congestion control
-	 * algorithms that we must have the following bandaid to talk
-	 * efficiently to them.  -DaveM
-	 */
-	tp->snd_cwnd = 2;
+    // 初始RTO、平滑偏差mdev
+    tp->rto  = TCP_TIMEOUT_INIT;
+    tp->mdev = TCP_TIMEOUT_INIT;
+    
+    /* So many TCP implementations out there (incorrectly count the
+     * initial SYN frame in their delayed-ACK and congestion control
+     * algorithms that we must have the following bandaid to talk
+     * efficiently to them.  -DaveM
+     */
+    // 初始拥塞窗口cwnd=2，兼容很多老旧TCP实现
+    tp->snd_cwnd = 2;
 
-	/* See draft-stevens-tcpca-spec-01 for discussion of the
-	 * initialization of these values.
-	 */
-	tp->snd_ssthresh = 0x7fffffff;	/* Infinity */
-	tp->snd_cwnd_clamp = ~0;
-	tp->mss_cache = 536;
+    /* See draft-stevens-tcpca-spec-01 for discussion of the
+     * initialization of these values.
+     */
+    // 慢启动阈值初始设为无穷大，一开始走慢启动
+    tp->snd_ssthresh = 0x7fffffff;  /* Infinity */
+    // cwnd上限，初始不限制
+    tp->snd_cwnd_clamp = ~0;
+    // 默认MSS缓存值536
+    tp->mss_cache = 536;
 
-	tp->reordering = sysctl_tcp_reordering;
+    // 报文重排阈值，取自全局sysctl参数
+    tp->reordering = sysctl_tcp_reordering;
 
-	sk->state = TCP_CLOSE;
+    // TCP连接初始状态：CLOSED
+    sk->state = TCP_CLOSE;
 
-	sk->write_space = tcp_write_space; 
+    // 发送缓冲区有空闲空间时的回调函数，唤醒等待发送的进程
+    sk->write_space = tcp_write_space; 
 
-	sk->tp_pinfo.af_tcp.af_specific = &ipv4_specific;
+    // 绑定ipv4专属操作集
+    sk->tp_pinfo.af_tcp.af_specific = &ipv4_specific;
 
-	sk->sndbuf = sysctl_tcp_wmem[1];
-	sk->rcvbuf = sysctl_tcp_rmem[1];
+    // 设置收发缓冲区默认大小，取自tcp_wmem/tcp_rmem中间档
+    sk->sndbuf = sysctl_tcp_wmem[1];
+    sk->rcvbuf = sysctl_tcp_rmem[1];
 
-	atomic_inc(&tcp_sockets_allocated);
+    // 全局TCP socket计数+1
+    atomic_inc(&tcp_sockets_allocated);
 
-	return 0;
+    return 0;
 }
 
 static int tcp_v4_destroy_sock(struct sock *sk)

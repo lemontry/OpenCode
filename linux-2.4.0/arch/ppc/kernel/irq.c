@@ -72,6 +72,7 @@ volatile unsigned char *chrp_int_ack_special;
 
 #define MAXCOUNT 10000000
 
+//中断处理的描述信息数组
 irq_desc_t irq_desc[NR_IRQS];
 int ppc_spurious_interrupts = 0;
 struct irqaction *ppc_irq_action[NR_IRQS];

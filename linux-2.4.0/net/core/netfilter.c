@@ -40,8 +40,20 @@
    sleep. */
 static DECLARE_MUTEX(nf_sockopt_mutex);
 
+/**
+ * nf_hooks - netfilter钩子二维数组
+ * 第一维：协议族 NPROTO（AF_INET、AF_UNIX等）
+ * 第二维：钩子点 NF_MAX_HOOKS（PREROUTING/INPUT/FORWARD/OUTPUT/POSTROUTING）
+ * 每个元素是链表头，保存挂载在该【协议族+钩子点】上的nf_hook_ops钩子
+ */
 struct list_head nf_hooks[NPROTO][NF_MAX_HOOKS];
+
+/**
+ * nf_sockopts - netfilter sock选项链表头
+ * 用来存放各个netfilter模块注册的setsockopt/getsockopt扩展选项
+ */
 static LIST_HEAD(nf_sockopts);
+
 
 /* 
  * A queue handler may be registered for each protocol.  Each is protected by
@@ -53,21 +65,34 @@ static struct nf_queue_handler_t {
 	void *data;
 } queue_handler[NPROTO];
 
+/**
+ * nf_register_hook - 注册netfilter钩子函数（Linux2.4）
+ * @reg: 钩子描述结构体，包含回调、协议族、钩子点、优先级
+ *
+ * 返回值：固定返回0（2.4这个版本该函数无失败分支）
+ * 说明：按优先级升序插入钩子链表；priority越小，越先执行
+ */
 int nf_register_hook(struct nf_hook_ops *reg)
 {
-	struct list_head *i;
+    struct list_head *i;
 
-	br_write_lock_bh(BR_NETPROTO_LOCK);
-	for (i = nf_hooks[reg->pf][reg->hooknum].next; 
-	     i != &nf_hooks[reg->pf][reg->hooknum]; 
-	     i = i->next) {
-		if (reg->priority < ((struct nf_hook_ops *)i)->priority)
-			break;
-	}
-	list_add(&reg->list, i->prev);
-	br_write_unlock_bh(BR_NETPROTO_LOCK);
-	return 0;
+    // 加写锁，关闭下半部，保护nf_hooks钩子链表并发修改
+    br_write_lock_bh(BR_NETPROTO_LOCK);
+    // 遍历 [协议族][钩子点] 对应的钩子链表
+    for (i = nf_hooks[reg->pf][reg->hooknum].next; 
+         i != &nf_hooks[reg->pf][reg->hooknum]; 
+         i = i->next) {
+        // 找到第一个优先级比当前钩子大的节点，在它前面插入
+        if (reg->priority < ((struct nf_hook_ops *)i)->priority)
+            break;
+    }
+    // 插入到i的前一个位置，保证链表按priority从小到大排序
+    list_add(&reg->list, i->prev);
+    // 解锁，恢复下半部
+    br_write_unlock_bh(BR_NETPROTO_LOCK);
+    return 0;
 }
+
 
 void nf_unregister_hook(struct nf_hook_ops *reg)
 {

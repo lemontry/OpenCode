@@ -36,29 +36,51 @@
 /*
  * These are used to make use of C type-checking..
  */
+/**
+ * 页表项类型定义，区分是否开启PAE物理地址扩展
+ * PAE：Physical Address Extension，x86 32位用来支持超过4GB物理内存
+ */
 #if CONFIG_X86_PAE
+// PAE开启：pte拆成低32位、高32位，合计64bit
 typedef struct { unsigned long pte_low, pte_high; } pte_t;
+// pmd、pgd直接64bit
 typedef struct { unsigned long long pmd; } pmd_t;
 typedef struct { unsigned long long pgd; } pgd_t;
-#define pte_val(x)	((x).pte_low | ((unsigned long long)(x).pte_high << 32))
+// 取出pte原始数值，拼接高低32位
+#define pte_val(x)  ((x).pte_low | ((unsigned long long)(x).pte_high << 32))
 #else
+// PAE关闭（普通32位非PAE）：pte仅32bit
 typedef struct { unsigned long pte_low; } pte_t;
 typedef struct { unsigned long pmd; } pmd_t;
 typedef struct { unsigned long pgd; } pgd_t;
-#define pte_val(x)	((x).pte_low)
+// 直接取出32位pte值
+#define pte_val(x)  ((x).pte_low)
 #endif
-#define PTE_MASK	PAGE_MASK
 
+/**
+ * PTE_MASK：页表项中页物理地址掩码，等于PAGE_MASK
+ * pgprot_t：页保护属性封装类型，用于隔离页权限标志
+ */
+#define PTE_MASK    PAGE_MASK
+
+// pgprot_t：页保护属性封装类型
 typedef struct { unsigned long pgprot; } pgprot_t;
 
-#define pmd_val(x)	((x).pmd)
-#define pgd_val(x)	((x).pgd)
-#define pgprot_val(x)	((x).pgprot)
+// 取出pmd_t原始数值
+#define pmd_val(x)  ((x).pmd)
+// 取出pgd_t原始数值
+#define pgd_val(x)  ((x).pgd)
+// 取出pgprot_t原始属性值
+#define pgprot_val(x)   ((x).pgprot)
 
+// 构造pte_t页表项
 #define __pte(x) ((pte_t) { (x) } )
+// 构造pmd_t中间页目录项
 #define __pmd(x) ((pmd_t) { (x) } )
+// 构造pgd_t页全局目录项
 #define __pgd(x) ((pgd_t) { (x) } )
-#define __pgprot(x)	((pgprot_t) { (x) } )
+// 构造pgprot_t页保护属性
+#define __pgprot(x) ((pgprot_t) { (x) } )
 
 #endif /* !__ASSEMBLY__ */
 
@@ -78,7 +100,17 @@ typedef struct { unsigned long pgprot; } pgprot_t;
  * and CONFIG_HIGHMEM64G options in the kernel configuration.
  */
 
-#define __PAGE_OFFSET		(0xC0000000)
+// x86 32位 Linux 2.4 内核
+// __PAGE_OFFSET：内核虚拟地址空间起始偏移
+/**
+ * 32 位虚拟地址：`0 ~ 0xFFFFFFFF`，总共 4GB
+
+- **0x00000000 ~ 0xBFFFFFFF（3GB）：用户态虚拟地址空间**
+- **0xC0000000 ~ 0xFFFFFFFF（1GB）：内核虚拟地址空间**
+
+`__PAGE_OFFSET = 0xC0000000` 就是**内核空间的起始地址**。
+ */
+#define __PAGE_OFFSET        (0xC0000000)
 
 #ifndef __ASSEMBLY__
 
@@ -112,8 +144,15 @@ extern __inline__ int get_order(unsigned long size)
 #endif /* __ASSEMBLY__ */
 
 #define PAGE_OFFSET		((unsigned long)__PAGE_OFFSET)
-#define __pa(x)			((unsigned long)(x)-PAGE_OFFSET)
-#define __va(x)			((void *)((unsigned long)(x)+PAGE_OFFSET))
+
+// 物理地址 → 内核线性地址（恒等映射区）
+/**
+ * `__va`：物理地址 + 0xC0000000 → 得到内核虚拟地址
+ * `__pa`：内核虚拟地址 - 0xC0000000 → 得到物理地址
+ */
+#define __pa(x)  ((unsigned long)(x) - __PAGE_OFFSET)
+#define __va(x)  ((void *)((unsigned long)(x) + __PAGE_OFFSET))
+
 #define virt_to_page(kaddr)	(mem_map + (__pa(kaddr) >> PAGE_SHIFT))
 #define VALID_PAGE(page)	((page - mem_map) < max_mapnr)
 

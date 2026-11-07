@@ -624,35 +624,51 @@ void dump_thread(struct pt_regs * regs, struct user * dump)
  * More important, however, is the fact that this allows us much
  * more flexibility.
  */
+/**
+ * void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ * @prev_p: 被切换出去的旧进程 task_struct
+ * @next_p: 将要上CPU运行的新进程 task_struct
+ * 调用来源：switch_to 宏内部 jmp __switch_to
+ * 功能：x86-32 Linux2.4 架构相关的硬件上下文切换
+ * switch_to汇编负责通用寄存器+内核栈切换；__switch_to负责FPU、TSS、fs/gs段、调试寄存器、IO权限位图
+ * 这个函数本质上就是对各种 CPU 特殊寄存器 + CPU 硬件关联的 TSS 内存结构做保存 / 加载。
+ */
 void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 {
 	struct thread_struct *prev = &prev_p->thread,
-				 *next = &next_p->thread;
+	                     *next = &next_p->thread;
+	// 获取当前CPU对应的TSS（任务状态段，SMP每个CPU一个TSS）
 	struct tss_struct *tss = init_tss + smp_processor_id();
 
+	// 【FPU处理】如果prev进程有未保存的浮点硬件状态，强制把FPU寄存器保存到prev的thread_struct
 	unlazy_fpu(prev_p);
 
 	/*
 	 * Reload esp0, LDT and the page table pointer:
 	 */
+	// 更新TSS的esp0：特权级0（内核态）栈顶。用户态发生中断/异常时CPU自动从TSS取esp0作为内核栈
 	tss->esp0 = next->esp0;
 
 	/*
 	 * Save away %fs and %gs. No need to save %es and %ds, as
 	 * those are always kernel segments while inside the kernel.
 	 */
+	// 保存旧进程 fs、gs 段选择子到 prev->fs / prev->gs
+	// es、ds在内核中固定使用内核段，不需要保存
 	asm volatile("movl %%fs,%0":"=m" (*(int *)&prev->fs));
 	asm volatile("movl %%gs,%0":"=m" (*(int *)&prev->gs));
 
 	/*
 	 * Restore %fs and %gs.
 	 */
+	// 加载新进程的 fs、gs 段寄存器（TLS/线程局部存储常用gs/fs）
 	loadsegment(fs, next->fs);
 	loadsegment(gs, next->gs);
 
 	/*
 	 * Now maybe reload the debug registers
 	 */
+	// 如果next进程设置了硬件断点（debugreg[7]存在标志），加载x86硬件调试寄存器 dr0~dr3,dr6,dr7
 	if (next->debugreg[7]){
 		loaddebug(next, 0);
 		loaddebug(next, 1);
@@ -663,6 +679,7 @@ void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 		loaddebug(next, 7);
 	}
 
+	// IO端口权限位图切换：ioperm()系统调用才会用到
 	if (prev->ioperm || next->ioperm) {
 		if (next->ioperm) {
 			/*
@@ -673,8 +690,10 @@ void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 			 * and playing VM tricks to switch the IO bitmap
 			 * is not really acceptable.]
 			 */
+			// next进程开启ioperm，拷贝next的io_bitmap到当前CPU TSS的io_bitmap
 			memcpy(tss->io_bitmap, next->io_bitmap,
-				 IO_BITMAP_SIZE*sizeof(unsigned long));
+			       IO_BITMAP_SIZE*sizeof(unsigned long));
+			// 设置TSS bitmap偏移，让CPU使用这个IO位图
 			tss->bitmap = IO_BITMAP_OFFSET;
 		} else
 			/*
@@ -683,9 +702,11 @@ void __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 			 * tries to use a port IO instruction. The first
 			 * sys_ioperm() call sets up the bitmap properly.
 			 */
+			// next没有ioperm，设置为非法偏移；进程执行in/out端口指令直接触发异常SIGSEGV
 			tss->bitmap = INVALID_IO_BITMAP_OFFSET;
 	}
 }
+
 
 asmlinkage int sys_fork(struct pt_regs regs)
 {

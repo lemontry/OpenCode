@@ -592,39 +592,57 @@ static int shmem_parse_options(char *options, int *mode, unsigned long * blocks,
 	return 0;
 }
 
+/**
+ * shmem_read_super - shmem/tmpfs文件系统的超级块读取&初始化回调（2.4内核）
+ * sb: 待初始化的super_block
+ * data: 挂载参数（字符串选项）
+ * silent: 是否静默，出错不打印
+ * return: 成功返回sb，失败NULL
+ */
 static struct super_block *shmem_read_super(struct super_block * sb, void * data, int silent)
 {
-	struct inode * inode;
-	struct dentry * root;
-	unsigned long blocks = ULONG_MAX;	/* unlimited */
-	unsigned long inodes = ULONG_MAX;	/* unlimited */
-	int mode   = S_IRWXUGO | S_ISVTX;
+    struct inode * inode;
+    struct dentry * root;
+    // 默认块数、inode数量不限制
+    unsigned long blocks = ULONG_MAX;   /* unlimited */
+    unsigned long inodes = ULONG_MAX;   /* unlimited */
+    // 根目录权限：rwxrwxrwx + 粘滞位S_ISVTX
+    int mode   = S_IRWXUGO | S_ISVTX;
 
-	if (shmem_parse_options (data, &mode, &blocks, &inodes)) {
-		printk(KERN_ERR "shmem fs invalid option\n");
-		return NULL;
-	}
+    // 解析挂载参数，比如size、nr_inodes限制
+    if (shmem_parse_options (data, &mode, &blocks, &inodes)) {
+        printk(KERN_ERR "shmem fs invalid option\n");
+        return NULL;
+    }
 
-	spin_lock_init (&sb->u.shmem_sb.stat_lock);
-	sb->u.shmem_sb.max_blocks = blocks;
-	sb->u.shmem_sb.free_blocks = blocks;
-	sb->u.shmem_sb.max_inodes = inodes;
-	sb->u.shmem_sb.free_inodes = inodes;
-	sb->s_blocksize = PAGE_CACHE_SIZE;
-	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
-	sb->s_magic = SHMEM_MAGIC;
-	sb->s_op = &shmem_ops;
-	inode = shmem_get_inode(sb, S_IFDIR | mode, 0);
-	if (!inode)
-		return NULL;
+    // 初始化shmem私有信息的保护自旋锁
+    spin_lock_init (&sb->u.shmem_sb.stat_lock);
+    // 设置shmem超级块私有统计信息：最大块、空闲块、最大inode、空闲inode
+    sb->u.shmem_sb.max_blocks = blocks;
+    sb->u.shmem_sb.free_blocks = blocks;
+    sb->u.shmem_sb.max_inodes = inodes;
+    sb->u.shmem_sb.free_inodes = inodes;
+    // 文件系统块大小 = 页面缓存大小（一页）
+    sb->s_blocksize = PAGE_CACHE_SIZE;
+    sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+    // shmem文件系统魔数 SHMEM_MAGIC
+    sb->s_magic = SHMEM_MAGIC;
+    // 挂载超级块对应的inode操作集 shmem_ops
+    sb->s_op = &shmem_ops;
+    // 创建根目录inode，类型S_IFDIR，mode是前面解析出来的权限
+    inode = shmem_get_inode(sb, S_IFDIR | mode, 0);
+    if (!inode)
+        return NULL;
 
-	root = d_alloc_root(inode);
-	if (!root) {
-		iput(inode);
-		return NULL;
-	}
-	sb->s_root = root;
-	return sb;
+    // 基于根inode创建root dentry（根目录）
+    root = d_alloc_root(inode);
+    if (!root) {
+        iput(inode);
+        return NULL;
+    }
+    // 把根dentry挂到super_block
+    sb->s_root = root;
+    return sb;
 }
 
 static int shmem_remount_fs (struct super_block *sb, int *flags, char *data)
@@ -701,6 +719,7 @@ static struct vm_operations_struct shmem_shared_vm_ops = {
 
 static DECLARE_FSTYPE(shmem_fs_type, "shm", shmem_read_super, FS_LITTER);
 
+//创建一个共享内存的文件系统
 static int __init init_shmem_fs(void)
 {
 	int error;
@@ -711,6 +730,7 @@ static int __init init_shmem_fs(void)
 		return error;
 	}
 
+	//挂在
 	res = kern_mount(&shmem_fs_type);
 	if (IS_ERR (res)) {
 		printk (KERN_ERR "could not kern_mount shmem fs\n");
@@ -804,53 +824,71 @@ void shmem_unuse(swp_entry_t entry, struct page *page)
  * @size: size to be set for the file
  *
  */
+/**
+ * shmem_file_setup - 在shmem文件系统中创建一个匿名内存文件（System V shm底层支撑）
+ * @name: 文件名字，例如"SYSVxxxxxxxx"
+ * @size: 文件大小
+ * return: 成功返回struct file*；失败返回ERR_PTR负错误码
+ */
 struct file *shmem_file_setup(char * name, loff_t size)
 {
-	int error;
-	struct file *file;
-	struct inode * inode;
-	struct dentry *dentry, *root;
-	struct qstr this;
-	int vm_enough_memory(long pages);
+    int error;
+    struct file *file;
+    struct inode * inode;
+    struct dentry *dentry, *root;
+    struct qstr this;
+    int vm_enough_memory(long pages);
 
-	error = -ENOMEM;
-	if (!vm_enough_memory((size) >> PAGE_SHIFT))
-		goto out;
+    error = -ENOMEM;
+    // 检查系统是否有足够空闲内存支撑这个文件所需page数量
+    if (!vm_enough_memory((size) >> PAGE_SHIFT))
+        goto out;
 
-	this.name = name;
-	this.len = strlen(name);
-	this.hash = 0; /* will go */
-	root = shmem_fs_type.kern_mnt->mnt_root;
-	dentry = d_alloc(root, &this);
-	if (!dentry)
-		goto out;
+    this.name = name;
+    this.len = strlen(name);
+    this.hash = 0; /* will go */
+    // shmem内核挂载点的根dentry
+    root = shmem_fs_type.kern_mnt->mnt_root;
+    // 分配dentry，挂载到shmem根目录下
+    dentry = d_alloc(root, &this);
+    if (!dentry)
+        goto out;
 
-	error = -ENFILE;
-	file = get_empty_filp();
-	if (!file)
-		goto put_dentry;
+    error = -ENFILE;
+    // 分配一个空闲的file结构体
+    file = get_empty_filp();
+    if (!file)
+        goto put_dentry;
 
-	error = -ENOSPC;
-	inode = shmem_get_inode(root->d_sb, S_IFREG | S_IRWXUGO, 0);
-	if (!inode) 
-		goto close_file;
+    error = -ENOSPC;
+    // 从shmem超级块分配shmem类型inode，普通文件、权限0777
+    inode = shmem_get_inode(root->d_sb, S_IFREG | S_IRWXUGO, 0);
+    if (!inode) 
+        goto close_file;
 
-	d_instantiate(dentry, inode);
-	dentry->d_inode->i_size = size;
-	file->f_vfsmnt = mntget(shmem_fs_type.kern_mnt);
-	file->f_dentry = dentry;
-	file->f_op = &shmem_file_operations;
-	file->f_mode = FMODE_WRITE | FMODE_READ;
-	inode->i_nlink = 0;	/* It is unlinked */
-	return(file);
+    // 绑定dentry和inode，实例化
+    d_instantiate(dentry, inode);
+    // 设置inode大小，对应共享内存段长度
+    dentry->d_inode->i_size = size;
+    // 增加vfsmount引用计数
+    file->f_vfsmnt = mntget(shmem_fs_type.kern_mnt);
+    file->f_dentry = dentry;
+    // 绑定shmem的文件操作表
+    file->f_op = &shmem_file_operations;
+    // 可读可写
+    file->f_mode = FMODE_WRITE | FMODE_READ;
+    inode->i_nlink = 0; /* It is unlinked */
+    // nlink=0：没有目录项硬链接，外部无法通过路径打开，内核私有匿名文件
+    return(file);
 
 close_file:
-	put_filp(file);
+    put_filp(file);
 put_dentry:
-	dput (dentry);
+    dput (dentry);
 out:
-	return ERR_PTR(error);	
+    return ERR_PTR(error);  
 }
+
 /*
  * shmem_zero_setup - setup a shared anonymous mapping
  *

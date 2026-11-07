@@ -67,7 +67,14 @@ static inline void copy_cow_page(struct page * from, struct page * to, unsigned 
 	copy_user_highpage(to, from, address);
 }
 
+/**
+ * mem_map - 全局page数组起始指针，Linux2.4 非NUMA UMA架构
+ * `mem_map` 是整个系统**所有物理页的 page 描述符数组的首地址**
+每一个物理帧（physical page frame）在内核中对应一个 `struct page`，全部连续存放在 `mem_map` 指向的数组里。
+`mem_map[pfn]` 就可以通过**页帧号 PFN**拿到对应物理页的 struct page。
+ */
 mem_map_t * mem_map;
+
 
 /*
  * Note: this doesn't free the actual pages themselves. That
@@ -1015,67 +1022,110 @@ void swapin_readahead(swp_entry_t entry)
 	return;
 }
 
+/**
+ * do_swap_page - 处理swap缺页，从交换分区换回页面，Linux2.4
+ * @mm: 进程内存描述符
+ * @vma: 触发缺页的虚拟内存区域
+ * @address: 触发缺页的虚拟地址
+ * @page_table: 对应PTE项指针
+ * @entry: swap条目，记录交换槽位置
+ * @write_access: 是否为写访问
+ * 返回值: -1失败；1成功，次缺页(minor fault)
+ */
 static int do_swap_page(struct mm_struct * mm,
-	struct vm_area_struct * vma, unsigned long address,
-	pte_t * page_table, swp_entry_t entry, int write_access)
+    struct vm_area_struct * vma, unsigned long address,
+    pte_t * page_table, swp_entry_t entry, int write_access)
 {
-	struct page *page = lookup_swap_cache(entry);
-	pte_t pte;
+    struct page *page = lookup_swap_cache(entry);
+    pte_t pte;
 
-	if (!page) {
-		lock_kernel();
-		swapin_readahead(entry);
-		page = read_swap_cache(entry);
-		unlock_kernel();
-		if (!page)
-			return -1;
+    // swap cache中没有该页面，需要从swap磁盘读取
+    if (!page) {
+        lock_kernel();
+        // swap预读，提前读取相邻swap页，提升性能
+        swapin_readahead(entry);
+        // 从swap读取页面，加入swap cache
+        page = read_swap_cache(entry);
+        unlock_kernel();
+        // 读取失败，返回-1
+        if (!page)
+            return -1;
 
-		flush_page_to_ram(page);
-		flush_icache_page(vma, page);
-	}
+        // 同步页面到内存
+        flush_page_to_ram(page);
+        // 刷新指令缓存，保证指令数据一致性
+        flush_icache_page(vma, page);
+    }
 
-	mm->rss++;
+    // 进程常驻内存计数增加
+    mm->rss++;
 
-	pte = mk_pte(page, vma->vm_page_prot);
+    // 根据page和vma保护属性构造pte
+    pte = mk_pte(page, vma->vm_page_prot);
 
-	/*
-	 * Freeze the "shared"ness of the page, ie page_count + swap_count.
-	 * Must lock page before transferring our swap count to already
-	 * obtained page count.
-	 */
-	lock_page(page);
-	swap_free(entry);
-	if (write_access && !is_page_shared(page))
-		pte = pte_mkwrite(pte_mkdirty(pte));
-	UnlockPage(page);
+    /*
+     * Freeze the "shared"ness of the page, ie page_count + swap_count.
+     * Must lock page before transferring our swap count to already
+     * obtained page count.
+     */
+    // 锁定page，防止并发修改引用计数
+    lock_page(page);
+    // 释放swap槽位，swap计数减一
+    swap_free(entry);
+    // 写访问且页面无其他共享，设置PTE可写+脏标记
+    if (write_access && !is_page_shared(page))
+        pte = pte_mkwrite(pte_mkdirty(pte));
+    UnlockPage(page);
 
-	set_pte(page_table, pte);
-	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(vma, address, pte);
-	return 1;	/* Minor fault */
+    // 回填页表项
+    set_pte(page_table, pte);
+    /* No need to invalidate - it was non-present before */
+    // 更新MMU缓存
+    update_mmu_cache(vma, address, pte);
+    return 1;   /* Minor fault */
 }
 
 /*
  * This only needs the MM semaphore
  */
+/**
+ * do_anonymous_page - 处理匿名页缺页异常（没有文件后端的私有页，比如栈、堆、bss）
+ * @mm: 当前进程的内存描述符
+ * @vma: 触发缺页的虚拟内存区域
+ * @page_table: 对应地址的pte项指针
+ * @write_access: 是否是写缺页，1=写访问，0=读访问
+ * @addr: 触发缺页的虚拟地址
+ * @return: 成功返回1（次缺页minor fault），分配失败返回-1
+ */
 static int do_anonymous_page(struct mm_struct * mm, struct vm_area_struct * vma, pte_t *page_table, int write_access, unsigned long addr)
 {
-	struct page *page = NULL;
-	pte_t entry = pte_wrprotect(mk_pte(ZERO_PAGE(addr), vma->vm_page_prot));
-	if (write_access) {
-		page = alloc_page(GFP_HIGHUSER);
-		if (!page)
-			return -1;
-		clear_user_highpage(page, addr);
-		entry = pte_mkwrite(pte_mkdirty(mk_pte(page, vma->vm_page_prot)));
-		mm->rss++;
-		flush_page_to_ram(page);
-	}
-	set_pte(page_table, entry);
-	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(vma, addr, entry);
-	return 1;	/* Minor fault */
+    struct page *page = NULL;
+    // 先构造只读pte：绑定零页ZERO_PAGE，并且标记写保护（缺页时读匿名页默认映射共享零页）
+    pte_t entry = pte_wrprotect(mk_pte(ZERO_PAGE(addr), vma->vm_page_prot));
+
+    // 如果是写访问触发的缺页：执行写时复制COW，分配独立物理页
+    if (write_access) {
+        // 分配用户页，GFP_HIGHUSER：优先从ZONE_HIGHMEM/ZONE_NORMAL分配，适合用户空间
+        page = alloc_page(GFP_HIGHUSER);
+        if (!page)
+            return -1;
+        // 清零新分配的页面（用户匿名页初始必须全0）
+        clear_user_highpage(page, addr);
+        // 构造可写、脏标记的pte
+        entry = pte_mkwrite(pte_mkdirty(mk_pte(page, vma->vm_page_prot)));
+        // 进程RSS物理页数+1
+        mm->rss++;
+        // 刷新cache，保证数据对CPU可见（早期架构需要）
+        flush_page_to_ram(page);
+    }
+    // 把pte写入页表
+    set_pte(page_table, entry);
+    /* No need to invalidate - it was non-present before */
+    // 更新MMU的缓存（TLB相关），缺页前pte是不存在的，不需要invalidate
+    update_mmu_cache(vma, addr, entry);
+    return 1;   /* Minor fault */
 }
+
 
 /*
  * do_no_page() tries to create a new page mapping. It aggressively
@@ -1088,48 +1138,70 @@ static int do_anonymous_page(struct mm_struct * mm, struct vm_area_struct * vma,
  *
  * This is called with the MM semaphore held.
  */
+/**
+ * do_no_page - 处理缺页异常，PTE不存在的主缺页逻辑，Linux2.4
+ * @mm: 进程内存描述符
+ * @vma: 触发缺页的虚拟内存区域
+ * @address: 触发缺页的虚拟地址
+ * @write_access: 本次缺页是否为写访问，1表示写，0表示读
+ * @page_table: 对应PTE项的指针
+ * 返回值: 0 触发SIGBUS；-1 OOM；2 成功，是主缺页(major fault)
+ */
 static int do_no_page(struct mm_struct * mm, struct vm_area_struct * vma,
-	unsigned long address, int write_access, pte_t *page_table)
+    unsigned long address, int write_access, pte_t *page_table)
 {
-	struct page * new_page;
-	pte_t entry;
+    struct page * new_page;
+    pte_t entry;
 
-	if (!vma->vm_ops || !vma->vm_ops->nopage)
-		return do_anonymous_page(mm, vma, page_table, write_access, address);
+    // VMA没有实现nopage回调，走匿名页缺页分支
+    if (!vma->vm_ops || !vma->vm_ops->nopage)
+        return do_anonymous_page(mm, vma, page_table, write_access, address);
 
-	/*
-	 * The third argument is "no_share", which tells the low-level code
-	 * to copy, not share the page even if sharing is possible.  It's
-	 * essentially an early COW detection.
-	 */
-	new_page = vma->vm_ops->nopage(vma, address & PAGE_MASK, (vma->vm_flags & VM_SHARED)?0:write_access);
-	if (new_page == NULL)	/* no page was available -- SIGBUS */
-		return 0;
-	if (new_page == NOPAGE_OOM)
-		return -1;
-	++mm->rss;
-	/*
-	 * This silly early PAGE_DIRTY setting removes a race
-	 * due to the bad i386 page protection. But it's valid
-	 * for other architectures too.
-	 *
-	 * Note that if write_access is true, we either now have
-	 * an exclusive copy of the page, or this is a shared mapping,
-	 * so we can make it writable and dirty to avoid having to
-	 * handle that later.
-	 */
-	flush_page_to_ram(new_page);
-	flush_icache_page(vma, new_page);
-	entry = mk_pte(new_page, vma->vm_page_prot);
-	if (write_access) {
-		entry = pte_mkwrite(pte_mkdirty(entry));
-	} else if (page_count(new_page) > 1 &&
-		   !(vma->vm_flags & VM_SHARED))
-		entry = pte_wrprotect(entry);
-	set_pte(page_table, entry);
-	/* no need to invalidate: a not-present page shouldn't be cached */
-	update_mmu_cache(vma, address, entry);
-	return 2;	/* Major fault */
+    /*
+     * The third argument is "no_share", which tells the low-level code
+     * to copy, not share the page even if sharing is possible.  It's
+     * essentially an early COW detection.
+     */
+    // 调用VMA的nopage回调，获取对应的物理page
+    // 私有映射：传入write_access，提前触发COW；共享映射传0，允许共享
+    new_page = vma->vm_ops->nopage(vma, address & PAGE_MASK, (vma->vm_flags & VM_SHARED)?0:write_access);
+    // nopage返回NULL，无后端页面，向进程发送SIGBUS
+    if (new_page == NULL)   /* no page was available -- SIGBUS */
+        return 0;
+    // nopage返回NOPAGE_OOM，内存不足
+    if (new_page == NOPAGE_OOM)
+        return -1;
+    // 进程常驻内存页数+1
+    ++mm->rss;
+    /*
+     * This silly early PAGE_DIRTY setting removes a race
+     * due to the bad i386 page protection. But it's valid
+     * for other architectures too.
+     *
+     * Note that if write_access is true, we either now have
+     * an exclusive copy of the page, or this is a shared mapping,
+     * so we can make it writable and dirty to avoid having to
+     * handle that later.
+     */
+    // 把页面数据刷入RAM，保证缓存一致性
+    flush_page_to_ram(new_page);
+    // 刷新指令cache，防止指令和数据cache不一致
+    flush_icache_page(vma, new_page);
+    // 根据page和vma保护属性构造pte
+    entry = mk_pte(new_page, vma->vm_page_prot);
+    // 如果是写访问，标记PTE可写、脏位
+    if (write_access) {
+        entry = pte_mkwrite(pte_mkdirty(entry));
+    } else if (page_count(new_page) > 1 &&
+           !(vma->vm_flags & VM_SHARED))
+        // 私有映射、页面引用计数大于1，设置写保护，后续写触发COW
+        entry = pte_wrprotect(entry);
+    // 将构造好的pte写入页表项
+    set_pte(page_table, entry);
+    /* no need to invalidate: a not-present page shouldn't be cached */
+    // 更新MMU缓存
+    update_mmu_cache(vma, address, entry);
+    return 2;   /* Major fault */
 }
 
 /*
@@ -1150,61 +1222,111 @@ static int do_no_page(struct mm_struct * mm, struct vm_area_struct * vma,
  * so we don't need to worry about a page being suddenly been added into
  * our VM.
  */
+/**
+ * static inline int handle_pte_fault(struct mm_struct *mm,
+ *     struct vm_area_struct * vma, unsigned long address,
+ *     int write_access, pte_t * pte)
+ * @mm:            进程内存描述符
+ * @vma:           本次缺页对应的vma
+ * @address:       故障虚拟地址
+ * @write_access:  1=写访问，0=读访问
+ * @pte:           指向PTE表项的指针
+ *
+ * 【说明】Linux 2.4 x86-32，PTE层缺页分发核心
+ * 前置：PGD/PMD/PTE页表框架已经由handle_mm_fault保证存在
+ * 锁：mm->page_table_lock，保护PTE，和kswapd、SMP下PTE原子更新互斥
+ * 返回值：
+ *    1 minor fault
+ *    2 major fault
+ *    0 失败(SIGBUS)
+ */
 static inline int handle_pte_fault(struct mm_struct *mm,
-	struct vm_area_struct * vma, unsigned long address,
-	int write_access, pte_t * pte)
+    struct vm_area_struct * vma, unsigned long address,
+    int write_access, pte_t * pte)
 {
-	pte_t entry;
+    pte_t entry;
 
-	/*
-	 * We need the page table lock to synchronize with kswapd
-	 * and the SMP-safe atomic PTE updates.
-	 */
-	spin_lock(&mm->page_table_lock);
-	entry = *pte;
-	if (!pte_present(entry)) {
-		/*
-		 * If it truly wasn't present, we know that kswapd
-		 * and the PTE updates will not touch it later. So
-		 * drop the lock.
-		 */
-		spin_unlock(&mm->page_table_lock);
-		if (pte_none(entry))
-			return do_no_page(mm, vma, address, write_access, pte);
-		return do_swap_page(mm, vma, address, pte, pte_to_swp_entry(entry), write_access);
-	}
+    /*
+     * 页表锁：保护PTE，防止和kswapd页面回收、SMP上其他CPU修改PTE发生竞争
+     * 这是细粒度锁，只保护这一个PTE相关的页表项
+     */
+    spin_lock(&mm->page_table_lock);
+    entry = *pte;
 
-	if (write_access) {
-		if (!pte_write(entry))
-			return do_wp_page(mm, vma, address, pte, entry);
+    if (!pte_present(entry)) {
+        /*
+         * PTE present位=0：物理页不在内存
+         * 此时kswapd不会再修改这个PTE，所以可以提前释放page_table_lock
+         * 后续do_no_page / do_swap_page是比较重的逻辑，不能拿着spinlock跑
+         */
+        spin_unlock(&mm->page_table_lock);
+        if (pte_none(entry))
+            /* PTE完全为空：从未分配过页，匿名页/文件映射初次缺页 */
+            return do_no_page(mm, vma, address, write_access, pte);
+        else
+            /* PTE不是present、也不是none：是swap entry，页面被换出到swap分区 */
+            return do_swap_page(mm, vma, address, pte, pte_to_swp_entry(entry), write_access);
+    }
 
-		entry = pte_mkdirty(entry);
-	}
-	entry = pte_mkyoung(entry);
-	establish_pte(vma, address, pte, entry);
-	spin_unlock(&mm->page_table_lock);
-	return 1;
+    /* ---------- 到这里：pte_present(entry) == 1，物理页在内存里 ---------- */
+    if (write_access) {
+        /* 本次是写访问，但PTE没有写权限 → 触发写保护缺页，Copy-On-Write */
+        if (!pte_write(entry))
+            return do_wp_page(mm, vma, address, pte, entry);
+
+        /* 有写权限：标记PTE为脏页，告诉kswapd回收时需要写回磁盘 */
+        entry = pte_mkdirty(entry);
+    }
+    /* 标记PTE为访问过（young，accessed），供kswapd的LRU页面淘汰算法使用 */
+    entry = pte_mkyoung(entry);
+
+    /* 把更新后的entry写回硬件PTE，刷新TLB */
+    establish_pte(vma, address, pte, entry);
+    spin_unlock(&mm->page_table_lock);
+    /* 这种场景属于minor fault，不需要IO，直接返回1 */
+    return 1;
 }
+
 
 /*
  * By the time we get here, we already hold the mm semaphore
  */
+/**
+ * int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct * vma,
+ *     unsigned long address, int write_access)
+ * @mm:            进程内存描述符
+ * @vma:           命中的虚拟内存区域
+ * @address:       触发缺页的虚拟地址
+ * @write_access:  1=写访问缺页，0=读访问缺页
+ *
+ * 【说明】Linux 2.4 x86-32，do_page_fault 的下层入口
+ * 职责：逐级分配页目录项(pgd → pmd → pte)，最后交给 handle_pte_fault 处理PTE层缺页逻辑
+ * 返回值：
+ *    1 : minor fault（次缺页，pagecache已有页，无磁盘IO）
+ *    2 : major fault（主缺页，需要从磁盘读入page）
+ *    0 : 失败（SIGBUS）
+ *   -1 : 其他异常
+ */
 int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct * vma,
-	unsigned long address, int write_access)
+    unsigned long address, int write_access)
 {
-	int ret = -1;
-	pgd_t *pgd;
-	pmd_t *pmd;
+    int ret = -1;
+    pgd_t *pgd;
+    pmd_t *pmd;
 
-	pgd = pgd_offset(mm, address);
-	pmd = pmd_alloc(pgd, address);
+    // 1. 根据mm和虚拟地址，找到对应的PGD（页全局目录）表项
+    pgd = pgd_offset(mm, address);
+    // 2. 分配PMD（页中间目录）：如果pgd有效但pmd不存在，则新建pmd页
+    pmd = pmd_alloc(pgd, address);
 
-	if (pmd) {
-		pte_t * pte = pte_alloc(pmd, address);
-		if (pte)
-			ret = handle_pte_fault(mm, vma, address, write_access, pte);
-	}
-	return ret;
+    if (pmd) {
+        // 3. 分配PTE（页表项）：pmd存在的前提下，分配pte页
+        pte_t * pte = pte_alloc(pmd, address);
+        if (pte)
+            // 4. 到PTE这一层，真正判断缺页类型、执行缺页逻辑
+            ret = handle_pte_fault(mm, vma, address, write_access, pte);
+    }
+    return ret;
 }
 
 /*

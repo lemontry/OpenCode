@@ -306,113 +306,144 @@ out:
  *	Create an inet socket.
  */
 
+/**
+ * inet_create - IPv4协议族socket创建回调，net_families[PF_INET]->create
+ * @sock: BSD层socket对象
+ * @protocol: 用户传入的子协议号
+ *
+ * 返回值：成功返回0；失败返回负错误码
+ * 说明：分配struct sock（sk）传输控制块，根据type区分TCP/UDP/RAW，绑定prot、ops，初始化inet私有字段，调用协议init、hash入哈希表
+ */
 static int inet_create(struct socket *sock, int protocol)
 {
-	struct sock *sk;
-	struct proto *prot;
+    struct sock *sk;
+    struct proto *prot;
 
-	sock->state = SS_UNCONNECTED;
-	sk = sk_alloc(PF_INET, GFP_KERNEL, 1);
-	if (sk == NULL) 
-		goto do_oom;
+    // 套接字初始状态：未连接
+    sock->state = SS_UNCONNECTED;
+    // 分配ipv4的底层传输控制块sk
+    sk = sk_alloc(PF_INET, GFP_KERNEL, 1);
+    if (sk == NULL)
+        goto do_oom;
 
-	switch (sock->type) {
-	case SOCK_STREAM:
-		if (protocol && protocol != IPPROTO_TCP)
-			goto free_and_noproto;
-		protocol = IPPROTO_TCP;
-		prot = &tcp_prot;
-		sock->ops = &inet_stream_ops;
-		break;
-	case SOCK_SEQPACKET:
-		goto free_and_badtype;
-	case SOCK_DGRAM:
-		if (protocol && protocol != IPPROTO_UDP)
-			goto free_and_noproto;
-		protocol = IPPROTO_UDP;
-		sk->no_check = UDP_CSUM_DEFAULT;
-		prot=&udp_prot;
-		sock->ops = &inet_dgram_ops;
-		break;
-	case SOCK_RAW:
-		if (!capable(CAP_NET_RAW))
-			goto free_and_badperm;
-		if (!protocol)
-			goto free_and_noproto;
-		prot = &raw_prot;
-		sk->reuse = 1;
-		sk->num = protocol;
-		sock->ops = &inet_dgram_ops;
-		if (protocol == IPPROTO_RAW)
-			sk->protinfo.af_inet.hdrincl = 1;
-		break;
-	default:
-		goto free_and_badtype;
-	}
+    // 根据socket类型分支处理
+    switch (sock->type) {
+    case SOCK_STREAM:
+        // 流式套接字固定为TCP；指定protocol且不是TCP则报错
+        if (protocol && protocol != IPPROTO_TCP)
+            goto free_and_noproto;
+        protocol = IPPROTO_TCP;
+        prot = &tcp_prot;
+        // 绑定BSD层TCP操作集（connect/accept/read/write等）
+        sock->ops = &inet_stream_ops;
+        break;
+    case SOCK_SEQPACKET:
+        // ipv4不支持SOCK_SEQPACKET
+        goto free_and_badtype;
+    case SOCK_DGRAM:
+        // 数据报套接字固定为UDP；指定protocol且不是UDP则报错
+        if (protocol && protocol != IPPROTO_UDP)
+            goto free_and_noproto;
+        protocol = IPPROTO_UDP;
+        sk->no_check = UDP_CSUM_DEFAULT;
+        prot=&udp_prot;
+        sock->ops = &inet_dgram_ops;
+        break;
+    case SOCK_RAW:
+        // RAW套接字需要CAP_NET_RAW权限
+        if (!capable(CAP_NET_RAW))
+            goto free_and_badperm;
+        // raw必须显式指定protocol
+        if (!protocol)
+            goto free_and_noproto;
+        prot = &raw_prot;
+        sk->reuse = 1;
+        sk->num = protocol;
+        sock->ops = &inet_dgram_ops;
+        // IPPROTO_RAW：由用户自己填充IP头部，hdrincl置1
+        if (protocol == IPPROTO_RAW)
+            sk->protinfo.af_inet.hdrincl = 1;
+        break;
+    default:
+        // 不支持的socket类型
+        goto free_and_badtype;
+    }
 
-	if (ipv4_config.no_pmtu_disc)
-		sk->protinfo.af_inet.pmtudisc = IP_PMTUDISC_DONT;
-	else
-		sk->protinfo.af_inet.pmtudisc = IP_PMTUDISC_WANT;
+    // 设置PMTU发现策略
+    if (ipv4_config.no_pmtu_disc)
+        sk->protinfo.af_inet.pmtudisc = IP_PMTUDISC_DONT;
+    else
+        sk->protinfo.af_inet.pmtudisc = IP_PMTUDISC_WANT;
 
-	sock_init_data(sock,sk);
+    // 建立sock和sk双向绑定，初始化公共sock字段
+    sock_init_data(sock,sk);
 
-	sk->destruct = inet_sock_destruct;
+    // 设置sk销毁回调函数
+    sk->destruct = inet_sock_destruct;
 
-	sk->zapped = 0;
-	sk->family = PF_INET;
-	sk->protocol = protocol;
+    sk->zapped = 0;
+    sk->family = PF_INET;
+    sk->protocol = protocol;
 
-	sk->prot = prot;
-	sk->backlog_rcv = prot->backlog_rcv;
+    // 绑定协议操作集（tcp_prot/udp_prot/raw_prot）
+    sk->prot = prot;
+    // 接收后备队列处理函数
+    sk->backlog_rcv = prot->backlog_rcv;
 
-	sk->protinfo.af_inet.ttl=sysctl_ip_default_ttl;
+    // IPv4私有参数：默认TTL
+    sk->protinfo.af_inet.ttl=sysctl_ip_default_ttl;
 
-	sk->protinfo.af_inet.mc_loop=1;
-	sk->protinfo.af_inet.mc_ttl=1;
-	sk->protinfo.af_inet.mc_index=0;
-	sk->protinfo.af_inet.mc_list=NULL;
+    // 组播默认参数
+    sk->protinfo.af_inet.mc_loop=1;
+    sk->protinfo.af_inet.mc_ttl=1;
+    sk->protinfo.af_inet.mc_index=0;
+    sk->protinfo.af_inet.mc_list=NULL;
 
 #ifdef INET_REFCNT_DEBUG
-	atomic_inc(&inet_sock_nr);
+    // 调试计数，inet sock总数
+    atomic_inc(&inet_sock_nr);
 #endif
 
-	if (sk->num) {
-		/* It assumes that any protocol which allows
-		 * the user to assign a number at socket
-		 * creation time automatically
-		 * shares.
-		 */
-		sk->sport = htons(sk->num);
+    // raw套接字这里sk->num=protocol，把协议号当作端口号，加入协议哈希链
+    if (sk->num) {
+        /* It assumes that any protocol which allows
+         * the user to assign a number at socket
+         * creation time automatically
+         * shares.
+         */
+        sk->sport = htons(sk->num);
 
-		/* Add to protocol hash chains. */
-		sk->prot->hash(sk);
-	}
+        /* Add to protocol hash chains. */
+        // 调用协议hash函数，把sk挂入全局哈希表
+        sk->prot->hash(sk);
+    }
 
-	if (sk->prot->init) {
-		int err = sk->prot->init(sk);
-		if (err != 0) {
-			inet_sock_release(sk);
-			return(err);
-		}
-	}
-	return(0);
+    // 调用协议自身的init回调（tcp_init/udp_init）
+    if (sk->prot->init) {
+        int err = sk->prot->init(sk);
+        if (err != 0) {
+            inet_sock_release(sk);
+            return(err);
+        }
+    }
+    return(0);
 
 free_and_badtype:
-	sk_free(sk);
-	return -ESOCKTNOSUPPORT;
+    sk_free(sk);
+    return -ESOCKTNOSUPPORT;
 
 free_and_badperm:
-	sk_free(sk);
-	return -EPERM;
+    sk_free(sk);
+    return -EPERM;
 
 free_and_noproto:
-	sk_free(sk);
-	return -EPROTONOSUPPORT;
+    sk_free(sk);
+    return -EPROTONOSUPPORT;
 
 do_oom:
-	return -ENOBUFS;
+    return -ENOBUFS;
 }
+
 
 
 /*
@@ -450,80 +481,106 @@ int inet_release(struct socket *sock)
 /* It is off by default, see below. */
 int sysctl_ip_nonlocal_bind;
 
+/**
+ * inet_bind - IPv4协议族BSD层bind回调函数
+ * @sock: BSD层socket对象
+ * @uaddr: 内核态的IPv4地址结构体 sockaddr_in
+ * @addr_len: 地址结构体长度
+ *
+ * 返回值：成功返回0；失败返回负错误码
+ * 说明：TCP、UDP通用bind实现；RAW套接字会走自身协议层bind。完成地址合法性校验、特权端口权限检查、状态检查、端口分配，填充sk本地地址信息。
+ */
 static int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 {
-	struct sockaddr_in *addr=(struct sockaddr_in *)uaddr;
-	struct sock *sk=sock->sk;
-	unsigned short snum;
-	int chk_addr_ret;
-	int err;
+    struct sockaddr_in *addr=(struct sockaddr_in *)uaddr;
+    struct sock *sk=sock->sk;
+    unsigned short snum;
+    int chk_addr_ret;
+    int err;
 
-	/* If the socket has its own bind function then use it. (RAW) */
-	if(sk->prot->bind)
-		return sk->prot->bind(sk, uaddr, addr_len);
+    /* If the socket has its own bind function then use it. (RAW) */
+    // 如果传输层协议实现了bind方法（RAW套接字），直接调用协议层bind
+    if(sk->prot->bind)
+        return sk->prot->bind(sk, uaddr, addr_len);  // struct proto tcp_prot 
 
-	if (addr_len < sizeof(struct sockaddr_in))
-		return -EINVAL;
+    // 校验地址长度，小于sockaddr_in最小长度，参数非法
+    if (addr_len < sizeof(struct sockaddr_in))
+        return -EINVAL;
 
-	chk_addr_ret = inet_addr_type(addr->sin_addr.s_addr);
+    // 查询地址类型：本地单播/组播/广播/不可达等路由类型
+    chk_addr_ret = inet_addr_type(addr->sin_addr.s_addr);
 
-	/* Not specified by any standard per-se, however it breaks too
-	 * many applications when removed.  It is unfortunate since
-	 * allowing applications to make a non-local bind solves
-	 * several problems with systems using dynamic addressing.
-	 * (ie. your servers still start up even if your ISDN link
-	 *  is temporarily down)
-	 */
-	if (sysctl_ip_nonlocal_bind == 0 && 
-	    sk->protinfo.af_inet.freebind == 0 &&
-	    addr->sin_addr.s_addr != INADDR_ANY &&
-	    chk_addr_ret != RTN_LOCAL &&
-	    chk_addr_ret != RTN_MULTICAST &&
-	    chk_addr_ret != RTN_BROADCAST)
-		return -EADDRNOTAVAIL;
+    /* Not specified by any standard per-se, however it breaks too
+     * many applications when removed.  It is unfortunate since
+     * allowing applications to make a non-local bind solves
+     * several problems with systems using dynamic addressing.
+     * (ie. your servers still start up even if your ISDN link
+     *  is temporarily down)
+     */
+    // 非本地地址绑定校验：默认禁止绑定本机不存在的IP，sysctl_ip_nonlocal_bind或者freebind可以放开限制
+    if (sysctl_ip_nonlocal_bind == 0 && 
+        sk->protinfo.af_inet.freebind == 0 &&
+        addr->sin_addr.s_addr != INADDR_ANY &&
+        chk_addr_ret != RTN_LOCAL &&
+        chk_addr_ret != RTN_MULTICAST &&
+        chk_addr_ret != RTN_BROADCAST)
+        return -EADDRNOTAVAIL;
 
-	snum = ntohs(addr->sin_port);
-	if (snum && snum < PROT_SOCK && !capable(CAP_NET_BIND_SERVICE))
-		return -EACCES;
+    // 端口从网络序转为主机序
+    snum = ntohs(addr->sin_port);
+    // 绑定特权端口（1~1023），没有CAP_NET_BIND_SERVICE权限则拒绝
+    if (snum && snum < PROT_SOCK && !capable(CAP_NET_BIND_SERVICE))
+        return -EACCES;
 
-	/*      We keep a pair of addresses. rcv_saddr is the one
-	 *      used by hash lookups, and saddr is used for transmit.
-	 *
-	 *      In the BSD API these are the same except where it
-	 *      would be illegal to use them (multicast/broadcast) in
-	 *      which case the sending device address is used.
-	 */
-	lock_sock(sk);
+    /*      We keep a pair of addresses. rcv_saddr is the one
+     *      used by hash lookups, and saddr is used for transmit.
+     *
+     *      In the BSD API these are the same except where it
+     *      would be illegal to use them (multicast/broadcast) in
+     *      which case the sending device address is used.
+     */
+    // 加sk锁，防止多线程并发修改sock状态、地址、端口
+    lock_sock(sk);
 
-	/* Check these errors (active socket, double bind). */
-	err = -EINVAL;
-	if ((sk->state != TCP_CLOSE)			||
-	    (sk->num != 0))
-		goto out;
+    /* Check these errors (active socket, double bind). */
+    // 预置错误码
+    err = -EINVAL;
+    // 状态校验：必须处于TCP_CLOSE、并且还没有绑定端口，禁止重复bind、连接后bind
+    if ((sk->state != TCP_CLOSE)        ||
+        (sk->num != 0))
+        goto out;
 
-	sk->rcv_saddr = sk->saddr = addr->sin_addr.s_addr;
-	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
-		sk->saddr = 0;  /* Use device */
+    // 接收查找地址、发送源地址默认设置为bind指定IP
+    sk->rcv_saddr = sk->saddr = addr->sin_addr.s_addr;
+    // 组播、广播地址特殊处理：发包时不使用该地址，改用网卡的主地址
+    if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
+        sk->saddr = 0;  /* Use device */
 
-	/* Make sure we are allowed to bind here. */
-	if (sk->prot->get_port(sk, snum) != 0) {
-		sk->saddr = sk->rcv_saddr = 0;
-		err = -EADDRINUSE;
-		goto out;
-	}
+    // 调用协议get_port，分配/校验端口；端口冲突返回-EADDRINUSE
+    if (sk->prot->get_port(sk, snum) != 0) {
+        sk->saddr = sk->rcv_saddr = 0;
+        err = -EADDRINUSE;
+        goto out;
+    }
 
-	if (sk->rcv_saddr)
-		sk->userlocks |= SOCK_BINDADDR_LOCK;
-	if (snum)
-		sk->userlocks |= SOCK_BINDPORT_LOCK;
-	sk->sport = htons(sk->num);
-	sk->daddr = 0;
-	sk->dport = 0;
-	sk_dst_reset(sk);
-	err = 0;
+    // 标记已经绑定固定IP地址
+    if (sk->rcv_saddr)
+        sk->userlocks |= SOCK_BINDADDR_LOCK;
+    // 标记已经绑定固定端口
+    if (snum)
+        sk->userlocks |= SOCK_BINDPORT_LOCK;
+    // 端口转为网络序存入sport
+    sk->sport = htons(sk->num);
+    // 清空对端地址、端口
+    sk->daddr = 0;
+    sk->dport = 0;
+    // 清空dst路由缓存
+    sk_dst_reset(sk);
+    err = 0;
 out:
-	release_sock(sk);
-	return err;
+    // 释放sk锁
+    release_sock(sk);
+    return err;
 }
 
 int inet_dgram_connect(struct socket *sock, struct sockaddr * uaddr,

@@ -41,6 +41,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next, str
 #endif
 		set_bit(cpu, &next->cpu_vm_mask);
 		/* Re-load page tables */
+		//装载CR3寄存器，pa：虚拟地址 -> 物理地址
 		asm volatile("movl %0,%%cr3": :"r" (__pa(next->pgd)));
 	}
 #ifdef CONFIG_SMP

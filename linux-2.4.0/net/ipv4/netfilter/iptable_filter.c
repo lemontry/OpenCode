@@ -125,46 +125,60 @@ static struct nf_hook_ops ipt_ops[]
 static int forward = NF_ACCEPT;
 MODULE_PARM(forward, "i");
 
+/**
+ * init - iptables filter表模块初始化函数（__init，内核启动initcall调用）
+ *
+ * 返回值：成功返回0；失败返回负错误码，自动回滚已注册资源
+ * 说明：filter表是iptables默认过滤表；设置forward默认策略，注册filter表，然后注册INPUT/FORWARD/OUTPUT三个netfilter钩子
+ */
 static int __init init(void)
 {
-	int ret;
+    int ret;
 
-	if (forward < 0 || forward > NF_MAX_VERDICT) {
-		printk("iptables forward must be 0 or 1\n");
-		return -EINVAL;
-	}
+    // 校验forward内核参数，只允许0或1
+    if (forward < 0 || forward > NF_MAX_VERDICT) {
+        printk("iptables forward must be 0 or 1\n");
+        return -EINVAL;
+    }
 
-	/* Entry 1 is the FORWARD hook */
-	initial_table.entries[1].target.verdict = -forward - 1;
+    /* Entry 1 is the FORWARD hook */
+    // 下标1对应FORWARD规则项，设置默认判决
+    // verdict = -forward -1：netfilter约定负数代表内置判决，-1=ACCEPT，-2=DROP
+    initial_table.entries[1].target.verdict = -forward - 1;
 
-	/* Register table */
-	ret = ipt_register_table(&packet_filter);
-	if (ret < 0)
-		return ret;
+    /* Register table */
+    // 向iptables核心注册filter表（packet_filter就是filter表描述符）
+    ret = ipt_register_table(&packet_filter);
+    if (ret < 0)
+        return ret;
 
-	/* Register hooks */
-	ret = nf_register_hook(&ipt_ops[0]);
-	if (ret < 0)
-		goto cleanup_table;
+    /* Register hooks */
+    // 注册第0个钩子：INPUT钩子
+    ret = nf_register_hook(&ipt_ops[0]);
+    if (ret < 0)
+        goto cleanup_table;
 
-	ret = nf_register_hook(&ipt_ops[1]);
-	if (ret < 0)
-		goto cleanup_hook0;
+    // 注册第1个钩子：FORWARD钩子
+    ret = nf_register_hook(&ipt_ops[1]);
+    if (ret < 0)
+        goto cleanup_hook0;
 
-	ret = nf_register_hook(&ipt_ops[2]);
-	if (ret < 0)
-		goto cleanup_hook1;
+    // 注册第2个钩子：OUTPUT钩子
+    ret = nf_register_hook(&ipt_ops[2]);
+    if (ret < 0)
+        goto cleanup_hook1;
 
-	return ret;
+    return ret;
 
+// 出错回滚：逆序卸载钩子、卸载表，防止资源泄漏
  cleanup_hook1:
-	nf_unregister_hook(&ipt_ops[1]);
+    nf_unregister_hook(&ipt_ops[1]);
  cleanup_hook0:
-	nf_unregister_hook(&ipt_ops[0]);
+    nf_unregister_hook(&ipt_ops[0]);
  cleanup_table:
-	ipt_unregister_table(&packet_filter);
+    ipt_unregister_table(&packet_filter);
 
-	return ret;
+    return ret;
 }
 
 static void __exit fini(void)

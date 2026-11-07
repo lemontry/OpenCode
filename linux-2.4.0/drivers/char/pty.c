@@ -29,13 +29,21 @@
 #define BUILDING_PTY_C 1
 #include <linux/devpts_fs.h>
 
+/**
+ * struct pty_struct - Linux2.4 PTY私有状态结构体
+ * 功能：保存单个pty配对实例的状态与等待队列，BSD pty、Unix98 pty共用该结构
+ */
 struct pty_struct {
-	int	magic;
-	wait_queue_head_t open_wait;
+    // 魔数，用于结构体合法性校验
+    int magic;
+    // 打开等待队列，pty打开阻塞时进程挂在此队列
+    wait_queue_head_t open_wait;
 };
+
 
 #define PTY_MAGIC 0x5001
 
+//伪终端的驱动
 static struct tty_driver pty_driver, pty_slave_driver;
 static int pty_refcount;
 
@@ -347,136 +355,198 @@ static void pty_set_termios(struct tty_struct *tty, struct termios *old_termios)
         tty->termios->c_cflag &= ~(CSIZE | PARENB);
         tty->termios->c_cflag |= (CS8 | CREAD);
 }
-
+/**
+ * pty_init - 内核初始化PTY子系统（BSD老式PTY + UNIX98 PTY）
+ * 返回值：0 初始化成功
+ * 说明：__init标记，仅内核启动阶段执行；分别构造、注册master和slave两类tty_driver
+ */
 int __init pty_init(void)
 {
-	int i;
+    int i;
 
-	/* Traditional BSD devices */
+    /* Traditional BSD devices */
 
-	memset(&pty_state, 0, sizeof(pty_state));
-	for (i = 0; i < NR_PTYS; i++)
-		init_waitqueue_head(&pty_state[i].open_wait);
-	memset(&pty_driver, 0, sizeof(struct tty_driver));
-	pty_driver.magic = TTY_DRIVER_MAGIC;
-	pty_driver.driver_name = "pty_master";
+    // 清空BSD pty状态数组
+    memset(&pty_state, 0, sizeof(pty_state));
+    // 逐个初始化BSD pty的打开等待队列头
+    for (i = 0; i < NR_PTYS; i++)
+        init_waitqueue_head(&pty_state[i].open_wait);
+    // 清空BSD master pty驱动实例
+    memset(&pty_driver, 0, sizeof(struct tty_driver));
+    // 设置驱动魔数，用于合法性校验
+    pty_driver.magic = TTY_DRIVER_MAGIC;
+    // 驱动底层名称
+    pty_driver.driver_name = "pty_master";
 #ifdef CONFIG_DEVFS_FS
-	pty_driver.name = "pty/m%d";
+    pty_driver.name = "pty/m%d";
 #else
-	pty_driver.name = "pty";
+    pty_driver.name = "pty";
 #endif
-	pty_driver.major = PTY_MASTER_MAJOR;
-	pty_driver.minor_start = 0;
-	pty_driver.num = NR_PTYS;
-	pty_driver.type = TTY_DRIVER_TYPE_PTY;
-	pty_driver.subtype = PTY_TYPE_MASTER;
-	pty_driver.init_termios = tty_std_termios;
-	pty_driver.init_termios.c_iflag = 0;
-	pty_driver.init_termios.c_oflag = 0;
-	pty_driver.init_termios.c_cflag = B38400 | CS8 | CREAD;
-	pty_driver.init_termios.c_lflag = 0;
-	pty_driver.flags = TTY_DRIVER_RESET_TERMIOS | TTY_DRIVER_REAL_RAW;
-	pty_driver.refcount = &pty_refcount;
-	pty_driver.table = pty_table;
-	pty_driver.termios = pty_termios;
-	pty_driver.termios_locked = pty_termios_locked;
-	pty_driver.driver_state = pty_state;
-	pty_driver.other = &pty_slave_driver;
+    // BSD pty master主设备号
+    pty_driver.major = PTY_MASTER_MAJOR;
+    // 次设备号起始编号
+    pty_driver.minor_start = 0;
+    // 支持pty实例数量
+    pty_driver.num = NR_PTYS;
+    // 驱动类型：PTY
+    pty_driver.type = TTY_DRIVER_TYPE_PTY;
+    // 子类型：master主端
+    pty_driver.subtype = PTY_TYPE_MASTER;
+    // 初始终端属性，使用标准tty配置
+    pty_driver.init_termios = tty_std_termios;
+    // 关闭输入标志
+    pty_driver.init_termios.c_iflag = 0;
+    // 关闭输出标志
+    pty_driver.init_termios.c_oflag = 0;
+    // 波特率38400、8位数据、使能接收
+    pty_driver.init_termios.c_cflag = B38400 | CS8 | CREAD;
+    // 关闭本地模式标志（回显、信号等）
+    pty_driver.init_termios.c_lflag = 0;
+    // 驱动标志：复位termios、原始raw模式
+    pty_driver.flags = TTY_DRIVER_RESET_TERMIOS | TTY_DRIVER_REAL_RAW;
+    // 引用计数指针
+    pty_driver.refcount = &pty_refcount;
+    // tty_struct实例数组
+    pty_driver.table = pty_table;
+    // termios配置数组
+    pty_driver.termios = pty_termios;
+    // 锁定状态termios数组
+    pty_driver.termios_locked = pty_termios_locked;
+    // 驱动私有状态
+    pty_driver.driver_state = pty_state;
+    // 指向配对的slave驱动
+    pty_driver.other = &pty_slave_driver;
 
-	pty_driver.open = pty_open;
-	pty_driver.close = pty_close;
-	pty_driver.write = pty_write;
-	pty_driver.write_room = pty_write_room;
-	pty_driver.flush_buffer = pty_flush_buffer;
-	pty_driver.chars_in_buffer = pty_chars_in_buffer;
-	pty_driver.unthrottle = pty_unthrottle;
-	pty_driver.set_termios = pty_set_termios;
+    // 底层open回调
+    pty_driver.open = pty_open;
+    // 底层close回调
+    pty_driver.close = pty_close;
+    // 底层write回调
+    pty_driver.write = pty_write;
+    // 查询发送缓冲区剩余可写空间
+    pty_driver.write_room = pty_write_room;
+    // 清空缓冲区回调
+    pty_driver.flush_buffer = pty_flush_buffer;
+    // 查询缓冲区待发送字符数
+    pty_driver.chars_in_buffer = pty_chars_in_buffer;
+    // 解除流控
+    pty_driver.unthrottle = pty_unthrottle;
+    // 修改终端属性回调
+    pty_driver.set_termios = pty_set_termios;
 
-	pty_slave_driver = pty_driver;
-	pty_slave_driver.driver_name = "pty_slave";
-	pty_slave_driver.proc_entry = 0;
+    // 从master驱动拷贝基础配置，构造slave驱动
+    pty_slave_driver = pty_driver;
+    // 修改驱动底层名称
+    pty_slave_driver.driver_name = "pty_slave";
+    // 清空proc节点
+    pty_slave_driver.proc_entry = 0;
 #ifdef CONFIG_DEVFS_FS
-	pty_slave_driver.name = "pty/s%d";
+    pty_slave_driver.name = "pty/s%d";
 #else
-	pty_slave_driver.name = "ttyp";
+    pty_slave_driver.name = "ttyp";
 #endif
-	pty_slave_driver.subtype = PTY_TYPE_SLAVE;
-	pty_slave_driver.major = PTY_SLAVE_MAJOR;
-	pty_slave_driver.minor_start = 0;
-	pty_slave_driver.init_termios = tty_std_termios;
-	pty_slave_driver.init_termios.c_cflag = B38400 | CS8 | CREAD;
-	/* Slave ptys are registered when their corresponding master pty
-	 * is opened, and unregistered when the pair is closed.
-	 */
-	pty_slave_driver.flags |= TTY_DRIVER_NO_DEVFS;
-	pty_slave_driver.table = ttyp_table;
-	pty_slave_driver.termios = ttyp_termios;
-	pty_slave_driver.termios_locked = ttyp_termios_locked;
-	pty_slave_driver.driver_state = pty_state;
-	pty_slave_driver.other = &pty_driver;
+    // 修改子类型为slave从端
+    pty_slave_driver.subtype = PTY_TYPE_SLAVE;
+    // BSD slave pty主设备号
+    pty_slave_driver.major = PTY_SLAVE_MAJOR;
+    pty_slave_driver.minor_start = 0;
+    // slave使用标准tty初始配置
+    pty_slave_driver.init_termios = tty_std_termios;
+    pty_slave_driver.init_termios.c_cflag = B38400 | CS8 | CREAD;
+    /* Slave ptys are registered when their corresponding master pty
+     * is opened, and unregistered when the pair is closed.
+     */
+    // 标记不自动在devfs创建节点，slave节点延迟创建
+    pty_slave_driver.flags |= TTY_DRIVER_NO_DEVFS;
+    // slave侧tty_struct数组
+    pty_slave_driver.table = ttyp_table;
+    // slave termios数组
+    pty_slave_driver.termios = ttyp_termios;
+    pty_slave_driver.termios_locked = ttyp_termios_locked;
+    // 和master共用同一套pty状态
+    pty_slave_driver.driver_state = pty_state;
+    // 配对指向master驱动
+    pty_slave_driver.other = &pty_driver;
 
-	if (tty_register_driver(&pty_driver))
-		panic("Couldn't register pty driver");
-	if (tty_register_driver(&pty_slave_driver))
-		panic("Couldn't register pty slave driver");
+    // 注册BSD master pty驱动，失败直接panic
+    if (tty_register_driver(&pty_driver))
+        panic("Couldn't register pty driver");
+    // 注册BSD slave pty驱动
+    if (tty_register_driver(&pty_slave_driver))
+        panic("Couldn't register pty slave driver");
 
-	/* 
-	 * only the master pty gets this ioctl (which is why we
-	 * assign it here, instead of up with the rest of the
-	 * pty_driver initialization. <cananian@alumni.princeton.edu>
-	 */
-	pty_driver.ioctl = pty_bsd_ioctl;
+    /* 
+     * only the master pty gets this ioctl (which is why we
+     * assign it here, instead of up with the rest of the
+     * pty_driver initialization. <cananian@alumni.princeton.edu>
+     */
+    // BSD master专属ioctl回调，放在注册之后单独赋值
+    pty_driver.ioctl = pty_bsd_ioctl;
 
-	/* Unix98 devices */
+    /* Unix98 devices */
 #ifdef CONFIG_UNIX98_PTYS
-	devfs_mk_dir (NULL, "pts", NULL);
-	printk("pty: %d Unix98 ptys configured\n", UNIX98_NR_MAJORS*NR_PTYS);
-	for ( i = 0 ; i < UNIX98_NR_MAJORS ; i++ ) {
-		int j;
+    // devfs下创建pts目录，存放unix98 slave节点
+    devfs_mk_dir (NULL, "pts", NULL);
+    printk("pty: %d Unix98 ptys configured\n", UNIX98_NR_MAJORS*NR_PTYS);
+    // 循环初始化多组UNIX98 PTY驱动
+    for ( i = 0 ; i < UNIX98_NR_MAJORS ; i++ ) {
+        int j;
 
-		ptm_driver[i] = pty_driver;
-		ptm_driver[i].name = "ptm";
-		ptm_driver[i].proc_entry = 0;
-		ptm_driver[i].major = UNIX98_PTY_MASTER_MAJOR+i;
-		ptm_driver[i].minor_start = 0;
-		ptm_driver[i].name_base = i*NR_PTYS;
-		ptm_driver[i].num = NR_PTYS;
-		ptm_driver[i].other = &pts_driver[i];
-		ptm_driver[i].flags |= TTY_DRIVER_NO_DEVFS;
-		ptm_driver[i].table = ptm_table[i];
-		ptm_driver[i].termios = ptm_termios[i];
-		ptm_driver[i].termios_locked = ptm_termios_locked[i];
-		ptm_driver[i].driver_state = ptm_state[i];
+        // 从基础pty_driver拷贝，构造UNIX98 master驱动ptm_driver
+        ptm_driver[i] = pty_driver;
+        ptm_driver[i].name = "ptm";
+        ptm_driver[i].proc_entry = 0;
+        // UNIX98 master主设备号，分组分配
+        ptm_driver[i].major = UNIX98_PTY_MASTER_MAJOR+i;
+        ptm_driver[i].minor_start = 0;
+        // 名字编号偏移
+        ptm_driver[i].name_base = i*NR_PTYS;
+        ptm_driver[i].num = NR_PTYS;
+        // 配对指向本组slave驱动
+        ptm_driver[i].other = &pts_driver[i];
+        // 不自动生成devfs节点
+        ptm_driver[i].flags |= TTY_DRIVER_NO_DEVFS;
+        ptm_driver[i].table = ptm_table[i];
+        ptm_driver[i].termios = ptm_termios[i];
+        ptm_driver[i].termios_locked = ptm_termios_locked[i];
+        ptm_driver[i].driver_state = ptm_state[i];
 
-		for (j = 0; j < NR_PTYS; j++)
-			init_waitqueue_head(&ptm_state[i][j].open_wait);
-		
-		pts_driver[i] = pty_slave_driver;
+        // 逐个初始化本组UNIX98 pty的等待队列
+        for (j = 0; j < NR_PTYS; j++)
+            init_waitqueue_head(&ptm_state[i][j].open_wait);
+        
+        // 拷贝master配置，构造本组UNIX98 slave驱动pts_driver
+        pts_driver[i] = pty_slave_driver;
 #ifdef CONFIG_DEVFS_FS
-		pts_driver[i].name = "pts/%d";
+        pts_driver[i].name = "pts/%d";
 #else
-		pts_driver[i].name = "pts";
+        pts_driver[i].name = "pts";
 #endif
-		pts_driver[i].proc_entry = 0;
-		pts_driver[i].major = UNIX98_PTY_SLAVE_MAJOR+i;
-		pts_driver[i].minor_start = 0;
-		pts_driver[i].name_base = i*NR_PTYS;
-		pts_driver[i].num = ptm_driver[i].num;
-		pts_driver[i].other = &ptm_driver[i];
-		pts_driver[i].table = pts_table[i];
-		pts_driver[i].termios = pts_termios[i];
-		pts_driver[i].termios_locked = pts_termios_locked[i];
-		pts_driver[i].driver_state = ptm_state[i];
-		
-		ptm_driver[i].ioctl = pty_unix98_ioctl;
-		
-		if (tty_register_driver(&ptm_driver[i]))
-			panic("Couldn't register Unix98 ptm driver major %d",
-			      ptm_driver[i].major);
-		if (tty_register_driver(&pts_driver[i]))
-			panic("Couldn't register Unix98 pts driver major %d",
-			      pts_driver[i].major);
-	}
+        pts_driver[i].proc_entry = 0;
+        // UNIX98 slave主设备号
+        pts_driver[i].major = UNIX98_PTY_SLAVE_MAJOR+i;
+        pts_driver[i].minor_start = 0;
+        pts_driver[i].name_base = i*NR_PTYS;
+        pts_driver[i].num = ptm_driver[i].num;
+        // 配对指向本组master驱动
+        pts_driver[i].other = &ptm_driver[i];
+        pts_driver[i].table = pts_table[i];
+        pts_driver[i].termios = pts_termios[i];
+        pts_driver[i].termios_locked = pts_termios_locked[i];
+        pts_driver[i].driver_state = ptm_state[i];
+        
+        // UNIX98 master使用专属ioctl回调（支持TIOCGPTN、TIOCSPTLCK）
+        ptm_driver[i].ioctl = pty_unix98_ioctl;
+        
+        // 注册本组UNIX98 master驱动
+        if (tty_register_driver(&ptm_driver[i]))
+            panic("Couldn't register Unix98 ptm driver major %d",
+                  ptm_driver[i].major);
+        // 注册本组UNIX98 slave驱动
+        if (tty_register_driver(&pts_driver[i]))
+            panic("Couldn't register Unix98 pts driver major %d",
+                  pts_driver[i].major);
+    }
 #endif
-	return 0;
+    return 0;
 }
