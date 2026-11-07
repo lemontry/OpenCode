@@ -20,8 +20,15 @@
 spinlock_t swaplock = SPIN_LOCK_UNLOCKED;
 unsigned int nr_swapfiles;
 
+/**
+ * swap_list_t - swap链表管理头，用于遍历所有swap设备，Linux2.4
+ */
 struct swap_list_t swap_list = {-1, -1};
 
+/**
+ * swap_info - 全局swap数组，保存所有swap设备/交换文件信息
+ * MAX_SWAPFILES：系统支持的swap最大数量
+ */
 struct swap_info_struct swap_info[MAX_SWAPFILES];
 
 #define SWAPFILE_CLUSTER 256

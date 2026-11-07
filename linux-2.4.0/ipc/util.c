@@ -49,34 +49,50 @@ void __init ipc_init (void)
  *	array itself. 
  */
  
+/**
+ * ipc_init_ids - 初始化ipc_ids管理结构
+ * @ids: 待初始化的ipc_ids对象（msg_ids/sem_ids/shm_ids）
+ * @size: 预期最大条目数
+ */
 void __init ipc_init_ids(struct ipc_ids* ids, int size)
 {
-	int i;
-	sema_init(&ids->sem,1);
+    int i;
+    // 初始化信号量sem，初值为1，互斥锁
+    sema_init(&ids->sem,1);
 
-	if(size > IPCMNI)
-		size = IPCMNI;
-	ids->size = size;
-	ids->in_use = 0;
-	ids->max_id = -1;
-	ids->seq = 0;
-	{
-		int seq_limit = INT_MAX/SEQ_MULTIPLIER;
-		if(seq_limit > USHRT_MAX)
-			ids->seq_max = USHRT_MAX;
-		 else
-		 	ids->seq_max = seq_limit;
-	}
+    // 不能超过IPC最大上限IPCMNI
+    if(size > IPCMNI)
+        size = IPCMNI;
+    // 设置entries数组容量
+    ids->size = size;
+    // 当前在用IPC对象数量初始化为0
+    ids->in_use = 0;
+    // 当前最大内核id初始为-1，表示还没有分配任何id
+    ids->max_id = -1;
+    // 序列号起始值为0
+    ids->seq = 0;
+    {
+        int seq_limit = INT_MAX/SEQ_MULTIPLIER;
+        // 计算seq上限，不超过unsigned short最大值
+        if(seq_limit > USHRT_MAX)
+            ids->seq_max = USHRT_MAX;
+        else
+            ids->seq_max = seq_limit;
+    }
 
-	ids->entries = ipc_alloc(sizeof(struct ipc_id)*size);
+    // 分配ipc_id条目数组
+    ids->entries = ipc_alloc(sizeof(struct ipc_id)*size);
 
-	if(ids->entries == NULL) {
-		printk(KERN_ERR "ipc_init_ids() failed, ipc service disabled.\n");
-		ids->size = 0;
-	}
-	ids->ary = SPIN_LOCK_UNLOCKED;
-	for(i=0;i<size;i++)
-		ids->entries[i].p = NULL;
+    if(ids->entries == NULL) {
+        // 内存分配失败，打印错误，禁用该类IPC
+        printk(KERN_ERR "ipc_init_ids() failed, ipc service disabled.\n");
+        ids->size = 0;
+    }
+    // 初始化ary自旋锁，初始为未上锁状态
+    ids->ary = SPIN_LOCK_UNLOCKED;
+    // 遍历清空，所有条目的指针初始置NULL，表示空闲
+    for(i=0;i<size;i++)
+        ids->entries[i].p = NULL;
 }
 
 /**
@@ -87,48 +103,73 @@ void __init ipc_init_ids(struct ipc_ids* ids, int size)
  *	Returns the identifier if found or -1 if not.
  */
  
+/**
+ * ipc_findkey - 根据key遍历查找对应的IPC内核id
+ * @ids: ipc_ids管理头
+ * @key: 用户传入的IPC键值
+ * return: 找到返回内核id，未找到返回-1
+ */
 int ipc_findkey(struct ipc_ids* ids, key_t key)
 {
-	int id;
-	struct kern_ipc_perm* p;
+    int id;
+    struct kern_ipc_perm* p;
 
-	for (id = 0; id <= ids->max_id; id++) {
-		p = ids->entries[id].p;
-		if(p==NULL)
-			continue;
-		if (key == p->key)
-			return id;
-	}
-	return -1;
+    // 遍历0到max_id范围内所有槽位
+    for (id = 0; id <= ids->max_id; id++) {
+        // 获取当前槽位保存的IPC权限结构指针
+        p = ids->entries[id].p;
+        // 槽位为空，跳过
+        if(p==NULL)
+            continue;
+        // 匹配key，返回对应的内核id
+        if (key == p->key)
+            return id;
+    }
+    // 全部遍历完毕，没有匹配的key
+    return -1;
 }
 
+
+/**
+ * grow_ary - 扩容ipc_ids的entries条目数组
+ * @ids: ipc_ids管理头
+ * @newsize: 期望的新容量
+ * return: 扩容之后最终生效的容量
+ */
 static int grow_ary(struct ipc_ids* ids, int newsize)
 {
-	struct ipc_id* new;
-	struct ipc_id* old;
-	int i;
+    struct ipc_id* new;
+    struct ipc_id* old;
+    int i;
 
-	if(newsize > IPCMNI)
-		newsize = IPCMNI;
-	if(newsize <= ids->size)
-		return newsize;
+    // 容量不能超过IPC全局最大限制IPCMNI
+    if(newsize > IPCMNI)
+        newsize = IPCMNI;
+    // 新容量不大于现有容量，无需扩容，直接返回
+    if(newsize <= ids->size)
+        return newsize;
 
-	new = ipc_alloc(sizeof(struct ipc_id)*newsize);
-	if(new == NULL)
-		return ids->size;
-	memcpy(new, ids->entries, sizeof(struct ipc_id)*ids->size);
-	for(i=ids->size;i<newsize;i++) {
-		new[i].p = NULL;
-	}
-	spin_lock(&ids->ary);
+    // 分配更大的entries数组空间
+    new = ipc_alloc(sizeof(struct ipc_id)*newsize);
+    if(new == NULL)
+        return ids->size;
+    // 拷贝原有数组内容到新数组
+    memcpy(new, ids->entries, sizeof(struct ipc_id)*ids->size);
+    // 新增的槽位全部初始化为空闲NULL
+    for(i=ids->size;i<newsize;i++) {
+        new[i].p = NULL;
+    }
+    // 自旋锁保护entries指针替换操作
+    spin_lock(&ids->ary);
 
-	old = ids->entries;
-	ids->entries = new;
-	i = ids->size;
-	ids->size = newsize;
-	spin_unlock(&ids->ary);
-	ipc_free(old, sizeof(struct ipc_id)*i);
-	return ids->size;
+    old = ids->entries;
+    ids->entries = new;
+    i = ids->size;
+    ids->size = newsize;
+    spin_unlock(&ids->ary);
+    // 释放旧数组内存
+    ipc_free(old, sizeof(struct ipc_id)*i);
+    return ids->size;
 }
 
 /**
@@ -143,31 +184,48 @@ static int grow_ary(struct ipc_ids* ids, int newsize)
  *	On failure the list is not locked and -1 is returned.
  */
  
+/**
+ * ipc_addid - 在ipc_ids管理表中分配一个空闲id，挂载新的IPC对象
+ * @ids: ipc_ids管理头（msg_ids/sem_ids/shm_ids）
+ * @new: 新IPC对象的kern_ipc_perm成员地址
+ * @size: 预期最大容量
+ * return: 成功返回分配到的内核id，失败返回-1
+ */
 int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
 {
-	int id;
+    int id;
 
-	size = grow_ary(ids,size);
-	for (id = 0; id < size; id++) {
-		if(ids->entries[id].p == NULL)
-			goto found;
-	}
-	return -1;
+    // 根据size扩容entries数组
+    size = grow_ary(ids,size);
+    // 遍历entries数组，寻找空闲槽位（p等于NULL）
+    for (id = 0; id < size; id++) {
+        if(ids->entries[id].p == NULL)
+            goto found;
+    }
+    return -1;
 found:
-	ids->in_use++;
-	if (id > ids->max_id)
-		ids->max_id = id;
+    // 正在使用的IPC对象计数加一
+    ids->in_use++;
+    // 更新当前最大id
+    if (id > ids->max_id)
+        ids->max_id = id;
 
-	new->cuid = new->uid = current->euid;
-	new->gid = new->cgid = current->egid;
+    // 设置创建者、属主的uid
+    new->cuid = new->uid = current->euid;
+    // 设置创建者、属主的gid
+    new->gid = new->cgid = current->egid;
 
-	new->seq = ids->seq++;
-	if(ids->seq > ids->seq_max)
-		ids->seq = 0;
+    // 分配序列号，序列号自增
+    new->seq = ids->seq++;
+    // 序列号到达上限后回绕归零
+    if(ids->seq > ids->seq_max)
+        ids->seq = 0;
 
-	spin_lock(&ids->ary);
-	ids->entries[id].p = new;
-	return id;
+    // 拿自旋锁保护entries数组
+    spin_lock(&ids->ary);
+    // 将新IPC对象挂载到找到的空闲槽位
+    ids->entries[id].p = new;
+    return id;
 }
 
 /**

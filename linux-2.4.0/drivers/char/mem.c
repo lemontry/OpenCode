@@ -489,6 +489,7 @@ static loff_t memory_lseek(struct file * file, loff_t offset, int orig)
 	}
 }
 
+//open的时候调用的
 static int open_port(struct inode * inode, struct file * filp)
 {
 	return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
@@ -501,51 +502,75 @@ static int open_port(struct inode * inode, struct file * filp)
 #define read_full       read_zero
 #define open_mem	open_port
 #define open_kmem	open_mem
-
+/**
+ * mem_fops - /dev/mem 设备的文件操作表
+ * 功能：直接访问物理内存，绕过虚拟内存映射
+ */
 static struct file_operations mem_fops = {
-	llseek:		memory_lseek,
-	read:		read_mem,
-	write:		write_mem,
-	mmap:		mmap_mem,
-	open:		open_mem,
+    llseek:     memory_lseek,
+    read:       read_mem,
+    write:      write_mem,
+    mmap:       mmap_mem,
+    open:       open_mem,
 };
 
+/**
+ * kmem_fops - /dev/kmem 设备的文件操作表
+ * 功能：访问内核虚拟地址空间
+ */
 static struct file_operations kmem_fops = {
-	llseek:		memory_lseek,
-	read:		read_kmem,
-	write:		write_kmem,
-	mmap:		mmap_kmem,
-	open:		open_kmem,
+    llseek:     memory_lseek,
+    read:       read_kmem,
+    write:      write_kmem,
+    mmap:       mmap_kmem,
+    open:       open_kmem,
 };
 
+/**
+ * null_fops - /dev/null 设备的文件操作表
+ * 功能：黑洞设备，读返回EOF，写入直接丢弃
+ */
 static struct file_operations null_fops = {
-	llseek:		null_lseek,
-	read:		read_null,
-	write:		write_null,
+    llseek:     null_lseek,
+    read:       read_null,
+    write:      write_null,
 };
 
 #if !defined(__mc68000__)
+/**
+ * port_fops - /dev/port 设备的文件操作表
+ * 功能：访问x86 IO端口（in/out指令），m68k架构无IO端口，排除编译
+ */
 static struct file_operations port_fops = {
-	llseek:		memory_lseek,
-	read:		read_port,
-	write:		write_port,
-	open:		open_port,
+    llseek:     memory_lseek,
+    read:       read_port,
+    write:      write_port,
+    open:       open_port,
 };
 #endif
 
+/**
+ * zero_fops - /dev/zero 设备的文件操作表
+ * 功能：读的时候源源不断返回0字节；写入丢弃数据，常用于匿名映射
+ */
 static struct file_operations zero_fops = {
-	llseek:		zero_lseek,
-	read:		read_zero,
-	write:		write_zero,
-	mmap:		mmap_zero,
+    llseek:     zero_lseek,
+    read:       read_zero,
+    write:      write_zero,
+    mmap:       mmap_zero,
 };
 
+/**
+ * full_fops - /dev/full 设备的文件操作表
+ * 功能：模拟磁盘满设备，写操作永远返回-ENOSPC
+ */
 static struct file_operations full_fops = {
-	llseek:		full_lseek,
-	read:		read_full,
-	write:		write_full,
+    llseek:     full_lseek,
+    read:       read_full,
+    write:      write_full,
 };
 
+//sys_mknod的时候就会调用到这里
 static int memory_open(struct inode * inode, struct file * filp)
 {
 	switch (MINOR(inode->i_rdev)) {
@@ -614,6 +639,7 @@ static struct file_operations memory_fops = {
 	open:		memory_open,	/* just a selector for the real open */
 };
 
+//todo: chrdev...
 int __init chr_dev_init(void)
 {
 	if (devfs_register_chrdev(MEM_MAJOR,"mem",&memory_fops))

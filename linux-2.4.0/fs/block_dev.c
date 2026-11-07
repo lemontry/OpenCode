@@ -426,31 +426,56 @@ static struct block_device *bdfind(dev_t dev, struct list_head *head)
 	return NULL;
 }
 
+/**
+ * bdget - 根据设备号dev获取block_device结构体（块设备描述符）
+ * @dev: 内核kdev_t块设备号（主+次设备号）
+ *
+ * 功能：在bdev_hashtable哈希表查找块设备对象；找不到则新建并插入哈希表
+ * 返回：成功返回引用计数+1的block_device*；内存分配失败返回NULL
+ * 说明：这是2.4内核的块设备bd缓存，init_special_inode创建S_IFBLK时调用
+ */
 struct block_device *bdget(dev_t dev)
 {
-	struct list_head * head = bdev_hashtable + hash(dev);
-	struct block_device *bdev, *new_bdev;
-	spin_lock(&bdev_lock);
-	bdev = bdfind(dev, head);
-	spin_unlock(&bdev_lock);
-	if (bdev)
-		return bdev;
-	new_bdev = alloc_bdev();
-	if (!new_bdev)
-		return NULL;
-	atomic_set(&new_bdev->bd_count,1);
-	new_bdev->bd_dev = dev;
-	new_bdev->bd_op = NULL;
-	spin_lock(&bdev_lock);
-	bdev = bdfind(dev, head);
-	if (!bdev) {
-		list_add(&new_bdev->bd_hash, head);
-		spin_unlock(&bdev_lock);
-		return new_bdev;
-	}
-	spin_unlock(&bdev_lock);
-	destroy_bdev(new_bdev);
-	return bdev;
+    // 根据dev计算hash桶，拿到哈希链表头
+    struct list_head * head = bdev_hashtable + hash(dev);
+    struct block_device *bdev, *new_bdev;
+
+    // 加锁，在哈希桶内查找该dev对应的bdev
+    spin_lock(&bdev_lock);
+    bdev = bdfind(dev, head);
+    spin_unlock(&bdev_lock);
+
+    // ✅ 找到了，直接返回（已经在哈希表中存在）
+    if (bdev)
+        return bdev;
+
+    // ❌ 哈希表没有，分配一个全新block_device
+    new_bdev = alloc_bdev();
+    if (!new_bdev)
+        return NULL;
+
+    // 初始化引用计数，初始引用为1
+    atomic_set(&new_bdev->bd_count,1);
+    // 记录这个块设备的设备号
+    new_bdev->bd_dev = dev;
+    // 块设备操作集先置空，后面打开设备时再填充
+    new_bdev->bd_op = NULL;
+
+    // 再次上锁，【二次查找】防止并发竞争（双检查锁思想）
+    spin_lock(&bdev_lock);
+    bdev = bdfind(dev, head);
+    if (!bdev) {
+        // 并发期间没有别人插入同一个dev，把新bdev挂入哈希链表
+        list_add(&new_bdev->bd_hash, head);
+        spin_unlock(&bdev_lock);
+        return new_bdev;
+    }
+    spin_unlock(&bdev_lock);
+
+    // 并发冲突：别的CPU已经抢先创建了这个dev的bdev
+    // 销毁刚才我们分配好的new_bdev，返回已经存在的bdev
+    destroy_bdev(new_bdev);
+    return bdev;
 }
 
 void bdput(struct block_device *bdev)

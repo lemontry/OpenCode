@@ -62,52 +62,89 @@ typedef enum {
 #define SOCK_ASYNC_WAITDATA	1
 #define SOCK_NOSPACE		2
 
+/**
+ * struct socket - BSD套接字层描述符（Linux2.4）
+ * 属于VFS上层的socket抽象，对应用户态操作的socket文件；
+ * 和下层传输控制块 struct sock(sk) 一一绑定
+ */
 struct socket
 {
-	socket_state		state;
+    // socket连接状态：SS_UNCONNECTED / SS_CONNECTED / SS_CONNECTING / SS_DISCONNECTING
+    socket_state        state;
 
-	unsigned long		flags;
-	struct proto_ops	*ops;
-	struct inode		*inode;
-	struct fasync_struct	*fasync_list;	/* Asynchronous wake up list	*/
-	struct file		*file;		/* File back pointer for gc	*/
-	struct sock		*sk;
-	wait_queue_head_t	wait;
+    // socket标志位
+    unsigned long       flags;
+    // 套接字操作函数集：bind/connect/accept/recvmsg/sendmsg等（inet_stream_ops、inet_dgram_ops）
+    struct proto_ops    *ops;
+    // 关联的VFS匿名inode，socket靠inode接入VFS文件系统模型
+    struct inode        *inode;
+    // 异步通知链表，fcntl(FASYNC)使用，信号异步唤醒进程
+    struct fasync_struct    *fasync_list;   /* Asynchronous wake up list    */
+    // 反向指向绑定的file结构体，sock_map_fd之后赋值，用于垃圾回收
+    struct file     *file;      /* File back pointer for gc */
+    // 底层传输层控制块，TCP/UDP/RAW的真正内核控制结构
+    struct sock     *sk;
+    // 等待队列头，阻塞读、阻塞写、阻塞accept时进程在此睡眠等待
+    wait_queue_head_t   wait;
 
-	short			type;
-	unsigned char		passcred;
+    // 套接字类型：SOCK_STREAM / SOCK_DGRAM / SOCK_RAW
+    short               type;
+    // 是否开启传递凭证（passcred），控制辅助消息携带pid/uid/gid
+    unsigned char       passcred;
 };
+
 
 #define SOCK_INODE(S)	((S)->inode)
 
 struct scm_cookie;
 struct vm_area_struct;
 
+/**
+ * struct proto_ops - BSD socket层操作函数表（Linux2.4）
+ * 对应用户态socket系统调用的回调集合，属于socket抽象层接口；
+ * 不同协议/类型套接字拥有各自实例，如inet_stream_ops(TCP)、inet_dgram_ops(UDP)
+ */
 struct proto_ops {
-  int	family;
+    // 协议族：PF_INET / PF_UNIX 等
+    int   family;
 
-  int	(*release)	(struct socket *sock);
-  int	(*bind)		(struct socket *sock, struct sockaddr *umyaddr,
-			 int sockaddr_len);
-  int	(*connect)	(struct socket *sock, struct sockaddr *uservaddr,
-			 int sockaddr_len, int flags);
-  int	(*socketpair)	(struct socket *sock1, struct socket *sock2);
-  int	(*accept)	(struct socket *sock, struct socket *newsock,
-			 int flags);
-  int	(*getname)	(struct socket *sock, struct sockaddr *uaddr,
-			 int *usockaddr_len, int peer);
-  unsigned int (*poll)	(struct file *file, struct socket *sock, struct poll_table_struct *wait);
-  int	(*ioctl)	(struct socket *sock, unsigned int cmd,
-			 unsigned long arg);
-  int	(*listen)	(struct socket *sock, int len);
-  int	(*shutdown)	(struct socket *sock, int flags);
-  int	(*setsockopt)	(struct socket *sock, int level, int optname,
-			 char *optval, int optlen);
-  int	(*getsockopt)	(struct socket *sock, int level, int optname,
-			 char *optval, int *optlen);
-  int   (*sendmsg)	(struct socket *sock, struct msghdr *m, int total_len, struct scm_cookie *scm);
-  int   (*recvmsg)	(struct socket *sock, struct msghdr *m, int total_len, int flags, struct scm_cookie *scm);
-  int	(*mmap)		(struct file *file, struct socket *sock, struct vm_area_struct * vma);
+    // 关闭释放socket资源，close最终走到这里
+    int   (*release)  (struct socket *sock);
+    // bind系统调用：绑定本地地址端口
+    int   (*bind)     (struct socket *sock, struct sockaddr *umyaddr,
+                 int sockaddr_len);
+    // connect系统调用：发起连接（TCP）或指定远端地址（UDP）
+    int   (*connect)  (struct socket *sock, struct sockaddr *uservaddr,
+                 int sockaddr_len, int flags);
+    // socketpair系统调用：创建一对相互连通的套接字（本地管道式socket）
+    int   (*socketpair)   (struct socket *sock1, struct socket *sock2);
+    // accept系统调用：TCP接受新连接，产出newsock新套接字
+    int   (*accept)   (struct socket *sock, struct socket *newsock,
+                 int flags);
+    // getsockname/getpeername：获取本地地址/对端地址，peer=1表示取对端
+    int   (*getname)  (struct socket *sock, struct sockaddr *uaddr,
+                 int *usockaddr_len, int peer);
+    // poll/select轮询回调，检测可读、可写、异常事件
+    unsigned int (*poll)  (struct file *file, struct socket *sock, struct poll_table_struct *wait);
+    // ioctl对socket执行控制命令
+    int   (*ioctl)    (struct socket *sock, unsigned int cmd,
+                 unsigned long arg);
+    // listen系统调用：TCP开启监听，设置backlog队列长度
+    int   (*listen)   (struct socket *sock, int len);
+    // shutdown系统调用：半关闭，关闭读方向/写方向
+    int   (*shutdown) (struct socket *sock, int flags);
+    // setsockopt系统调用：设置socket选项
+    int   (*setsockopt)   (struct socket *sock, int level, int optname,
+                 char *optval, int optlen);
+    // getsockopt系统调用：读取socket选项
+    int   (*getsockopt)   (struct socket *sock, int level, int optname,
+                 char *optval, int *optlen);
+    // sendmsg系统调用：通用发送消息接口，send/sendto底层都走它
+    int   (*sendmsg)  (struct socket *sock, struct msghdr *m, int total_len, struct scm_cookie *scm);
+    // recvmsg系统调用：通用接收消息接口，recv/recvfrom底层都走它
+    int   (*recvmsg)  (struct socket *sock, struct msghdr *m, int total_len, int flags, struct scm_cookie *scm);
+    // mmap：socket支持内存映射（少数套接字类型实现）
+    int   (*mmap)     (struct file *file, struct socket *sock, struct vm_area_struct * vma);
 };
 
 struct net_proto_family 

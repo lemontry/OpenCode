@@ -8,7 +8,7 @@
  *
  *  Force Cyrix 6x86(MX) and M II processors to report MTRR capability
  *  and Cyrix "coma bug" recognition by
- *      Zolt�n B�sz�rm�nyi <zboszor@mail.externet.hu> February 1999.
+ *      Zolt�n B�sz�rm�nyi <zboszor@mail.externet.hu> February 1999.
  * 
  *  Force Centaur C6 processors to report MTRR capability.
  *      Bart Hartgers <bart@etpmod.phys.tue.nl>, May 1999.
@@ -132,7 +132,23 @@ struct sys_desc_table_struct {
 	unsigned char table[0];
 };
 
+/**
+ * struct e820map e820;
+ * 全局变量：内核保存清洗之后的E820内存映射表
+ * 定义位置：arch/i386/kernel/setup.c
+ * __init 阶段使用，内核启动早期内存探测的核心数据源
+ *
+ * 来源链路：
+ * setup.S 实模式int 0x15 e820 → 写入零页临时缓冲区
+ * copy_e820_map() 校验、切割、修复BIOS原始条目
+ * add_memory_region() 合并相邻同类型区间，填入这个全局e820
+ *
+ * 使用者：
+ * setup_arch、bootmem初始化、free_area_init_core
+ * 用来识别可用RAM、保留内存、内存空洞，计算max_pfn/max_low_pfn
+ */
 struct e820map e820;
+
 
 unsigned char aux_device_present;
 
@@ -142,11 +158,42 @@ extern int rd_prompt;		/* 1 = prompt for ramdisk, 0 = don't prompt */
 extern int rd_image_start;	/* starting block # of image */
 #endif
 
+/**
+ * extern int root_mountflags;
+ * 全局变量：根文件系统挂载标志位
+ * 作用：保存挂载rootfs时的mount flags，比如只读MS_RDONLY等
+ * 内核启动早期解析启动参数（cmdline）时赋值，mount根文件系统时使用
+ */
 extern int root_mountflags;
+
+/**
+ * extern char _text, _etext, _edata, _end;
+ * 链接脚本定义的符号，不是变量，只是地址标记（char类型仅用来取地址）
+ * &_text   : 内核代码段(.text)起始虚拟地址
+ * &_etext  : 内核代码段结束地址（代码段末尾）
+ * &_edata  : 初始化数据段(.data)结束地址
+ * &_end    : 内核BSS段(.bss)结束地址，整个内核镜像的末尾
+ * 用途：启动时标记内核镜像占用的物理内存，bootmem把这段标记为已占用，防止分配出去
+ */
 extern char _text, _etext, _edata, _end;
+
+/**
+ * extern unsigned long cpu_khz;
+ * 全局变量：CPU主频，单位kHz
+ * 内核启动时通过校准TSC（时间戳计数器）计算得到
+ * 用于延时、tsc计时、精度相关时间计算
+ */
 extern unsigned long cpu_khz;
 
+/**
+ * static int disable_x86_serial_nr __initdata = 1;
+ * __initdata：标记这个变量放在【初始化专用数据段】
+ * 内核初始化完成之后，这一段内存会被释放回收，不再占用
+ * disable_x86_serial_nr：是否关闭x86 CPU序列号读取
+ * =1：默认关闭（不读取CPU serial number，早期奔腾3有CPU序列号，有隐私争议）
+ */
 static int disable_x86_serial_nr __initdata = 1;
+
 
 /*
  * This is set up by the setup-routine at boot-time
@@ -453,39 +500,63 @@ static void __init print_memory_map(char *who)
  * thinkpad 560x, for example, does not cooperate with the memory
  * detection code.)
  */
+/**
+ * copy_e820_map - 把BIOS零页里原始E820条目拷贝、修正，存入内核全局e820表
+ * @biosmap:  入参，BIOS存放在零页的原始e820entry数组起始地址
+ * @nr_map:   入参，BIOS返回的原始条目总数
+ * 返回值：0 成功；-1 失败，E820数据无效，内核回退老式内存探测方式
+ *
+ * 调用位置：setup_memory_region()
+ * 作用：
+ * 1. 合法性校验原始E820条目数量
+ * 2. 遍历每一条BIOS返回的内存段，做溢出检查
+ * 3. 修复BIOS常见bug：640K~1M区间不能当成可用RAM（这段是显存/BIOS区域）
+ * 4. 调用add_memory_region()，把清洗后的条目添加到内核全局struct e820map e820
+ */
 static int __init copy_e820_map(struct e820entry * biosmap, int nr_map)
 {
-	/* Only one memory region (or negative)? Ignore it */
-	if (nr_map < 2)
-		return -1;
+    /* Only one memory region (or negative)? Ignore it */
+    // 原始条目小于2条，认为BIOS的E820表不可靠，直接返回失败
+    if (nr_map < 2)
+        return -1;
 
-	do {
-		unsigned long long start = biosmap->addr;
-		unsigned long long size = biosmap->size;
-		unsigned long long end = start + size;
-		unsigned long type = biosmap->type;
+    do {
+        // 取出当前这条内存段的起始地址、长度、类型
+        unsigned long long start = biosmap->addr;
+        unsigned long long size = biosmap->size;
+        unsigned long long end = start + size;
+        unsigned long type = biosmap->type;
 
-		/* Overflow in 64 bits? Ignore the memory map. */
-		if (start > end)
-			return -1;
+        /* Overflow in 64 bits? Ignore the memory map. */
+        // 64位地址相加溢出，end < start，这条数据非法，整张E820作废
+        if (start > end)
+            return -1;
 
-		/*
-		 * Some BIOSes claim RAM in the 640k - 1M region.
-		 * Not right. Fix it up.
-		 */
-		if (type == E820_RAM) {
-			if (start < 0x100000ULL && end > 0xA0000ULL) {
-				if (start < 0xA0000ULL)
-					add_memory_region(start, 0xA0000ULL-start, type);
-				if (end <= 0x100000ULL)
-					continue;
-				start = 0x100000ULL;
-				size = end - start;
-			}
-		}
-		add_memory_region(start, size, type);
-	} while (biosmap++,--nr_map);
-	return 0;
+        /*
+         * Some BIOSes claim RAM in the 640k - 1M region.
+         * Not right. Fix it up.
+         */
+        // 修复BIOS bug：有些BIOS错误把 640K(0xA0000) ~ 1M(0x100000) 标记为可用RAM
+        // 这个区间是VGA显存、BIOS ROM，不能作为可用内存，需要切割
+        if (type == E820_RAM) {
+            // 条件：本段可用RAM跨了 640K ~ 1M 这个危险区间
+            if (start < 0x100000ULL && end > 0xA0000ULL) {
+                // 先保留 0 ~ 0xA0000（640K以内，常规可用低内存）
+                if (start < 0xA0000ULL)
+                    add_memory_region(start, 0xA0000ULL-start, type);
+                // 如果整个段都落在1M以内，切割完毕，跳过本条后续add
+                if (end <= 0x100000ULL)
+                    continue;
+                // 把起始地址跳到1M，1M以上部分才是真正可用的RAM
+                start = 0x100000ULL;
+                size = end - start;
+            }
+        }
+        // 将清洗、切割后的内存段，添加进内核全局e820表
+        add_memory_region(start, size, type);
+    } while (biosmap++,--nr_map); // 指针后移，条目计数-1，循环遍历所有BIOS条目
+
+    return 0;
 }
 
 /*
@@ -494,36 +565,55 @@ static int __init copy_e820_map(struct e820entry * biosmap, int nr_map)
  */
 #define LOWMEMSIZE()	(0x9f000)
 
+/**
+ * 上电后 BIOS 扫描主板内存，生成 **E820 内存映射表**。
+E820 里记录每一段内存：
+- 可用 RAM（usable）
+- 保留内存：BIOS、MMIO、ROM、ACPI、显存、空洞（hole），**不能拿来分配给内核**
+  内核拿到这个表，才知道：哪些物理地址是真内存、哪些不能碰。
+ * 
+ */
+ */
+/**
+ * setup_memory_region - 读取BIOS内存布局，填充全局e820内存映射表，Linux2.4 x86
+ * 调用时机：setup_arch内部，是内核获取物理内存信息的第一步
+ * 无返回值
+ */
 void __init setup_memory_region(void)
 {
-	char *who = "BIOS-e820";
+    char *who = "BIOS-e820";
 
-	/*
-	 * Try to copy the BIOS-supplied E820-map.
-	 *
-	 * Otherwise fake a memory map; one section from 0k->640k,
-	 * the next section from 1mb->appropriate_mem_k
-	 */
-	if (copy_e820_map(E820_MAP, E820_MAP_NR) < 0) {
-		unsigned long mem_size;
+    /*
+     * Try to copy the BIOS-supplied E820-map.
+     *
+     * Otherwise fake a memory map; one section from 0k->640k,
+     * the next section from 1mb->appropriate_mem_k
+     */
+    // 优先拷贝BIOS传递的标准E820内存映射
+    if (copy_e820_map(E820_MAP, E820_MAP_NR) < 0) {
+        unsigned long mem_size;
 
-		/* compare results from other methods and take the greater */
-		if (ALT_MEM_K < EXT_MEM_K) {
-			mem_size = EXT_MEM_K;
-			who = "BIOS-88";
-		} else {
-			mem_size = ALT_MEM_K;
-			who = "BIOS-e801";
-		}
+        // E820不可用，降级使用老式BIOS内存检测方法
+        // ALT_MEM_K(e801)、EXT_MEM_K(88h)，取更大的内存值
+        if (ALT_MEM_K < EXT_MEM_K) {
+            mem_size = EXT_MEM_K;
+            who = "BIOS-88";
+        } else {
+            mem_size = ALT_MEM_K;
+            who = "BIOS-e801";
+        }
 
-		e820.nr_map = 0;
-		add_memory_region(0, LOWMEMSIZE(), E820_RAM);
-		add_memory_region(HIGH_MEMORY, (mem_size << 10) - HIGH_MEMORY, E820_RAM);
-  	}
-	printk("BIOS-provided physical RAM map:\n");
-	print_memory_map(who);
+        // 清空e820表项计数，手动构造内存布局
+        e820.nr_map = 0;
+        // 0~640KB 低端常规内存
+        add_memory_region(0, LOWMEMSIZE(), E820_RAM);
+        // 1MB以上扩展内存
+        add_memory_region(HIGH_MEMORY, (mem_size << 10) - HIGH_MEMORY, E820_RAM);
+    }
+    printk("BIOS-provided physical RAM map:\n");
+    // 打印最终的内存映射，who标记数据源（e820 / 88 / e801）
+    print_memory_map(who);
 } /* setup_memory_region */
-
 
 static inline void parse_mem_cmdline (char ** cmdline_p)
 {
@@ -595,261 +685,296 @@ static inline void parse_mem_cmdline (char ** cmdline_p)
 	}
 }
 
+/**
+ * setup_arch - x86架构早期初始化，解析BIOS内存布局、启动bootmem、调用paging_init，Linux2.4
+ * @cmdline_p: 输出参数，内核启动命令行指针
+ * 调用时机：start_kernel() 中很早的位置，是架构相关初始化入口
+ * 无返回值
+ */
 void __init setup_arch(char **cmdline_p)
 {
-	unsigned long bootmap_size;
-	unsigned long start_pfn, max_pfn, max_low_pfn;
-	int i;
+    unsigned long bootmap_size;
+    unsigned long start_pfn, max_pfn, max_low_pfn;
+    int i;
 
 #ifdef CONFIG_VISWS
-	visws_get_board_type_and_rev();
+    // VISWS特殊板卡，读取板类型与版本
+    visws_get_board_type_and_rev();
 #endif
 
- 	ROOT_DEV = to_kdev_t(ORIG_ROOT_DEV);
- 	drive_info = DRIVE_INFO;
- 	screen_info = SCREEN_INFO;
-	apm_info.bios = APM_BIOS_INFO;
-	if( SYS_DESC_TABLE.length != 0 ) {
-		MCA_bus = SYS_DESC_TABLE.table[3] &0x2;
-		machine_id = SYS_DESC_TABLE.table[0];
-		machine_submodel_id = SYS_DESC_TABLE.table[1];
-		BIOS_revision = SYS_DESC_TABLE.table[2];
-	}
-	aux_device_present = AUX_DEVICE_INFO;
+    // 从bootloader拿到根设备、硬盘信息、屏幕、APM等BIOS传递的数据
+    ROOT_DEV = to_kdev_t(ORIG_ROOT_DEV);
+    drive_info = DRIVE_INFO;
+    screen_info = SCREEN_INFO;
+    apm_info.bios = APM_BIOS_INFO;
+    if( SYS_DESC_TABLE.length != 0 ) {
+        MCA_bus = SYS_DESC_TABLE.table[3] &0x2;
+        machine_id = SYS_DESC_TABLE.table[0];
+        machine_submodel_id = SYS_DESC_TABLE.table[1];
+        BIOS_revision = SYS_DESC_TABLE.table[2];
+    }
+    aux_device_present = AUX_DEVICE_INFO;
 
 #ifdef CONFIG_BLK_DEV_RAM
-	rd_image_start = RAMDISK_FLAGS & RAMDISK_IMAGE_START_MASK;
-	rd_prompt = ((RAMDISK_FLAGS & RAMDISK_PROMPT_FLAG) != 0);
-	rd_doload = ((RAMDISK_FLAGS & RAMDISK_LOAD_FLAG) != 0);
+    // ramdisk参数：是否提示、是否加载镜像
+    rd_image_start = RAMDISK_FLAGS & RAMDISK_IMAGE_START_MASK;
+    rd_prompt = ((RAMDISK_FLAGS & RAMDISK_PROMPT_FLAG) != 0);
+    rd_doload = ((RAMDISK_FLAGS & RAMDISK_LOAD_FLAG) != 0);
 #endif
-	setup_memory_region();
+    // 读取e820内存映射，填充e820全局数组
+	// int 0x15, eax=0xE820
+    setup_memory_region();
 
-	if (!MOUNT_ROOT_RDONLY)
-		root_mountflags &= ~MS_RDONLY;
-	init_mm.start_code = (unsigned long) &_text;
-	init_mm.end_code = (unsigned long) &_etext;
-	init_mm.end_data = (unsigned long) &_edata;
-	init_mm.brk = (unsigned long) &_end;
+    // 根文件系统默认只读标记
+    if (!MOUNT_ROOT_RDONLY)
+        root_mountflags &= ~MS_RDONLY;
+    // 初始化init_mm（内核0号进程的mm_struct），记录内核代码/数据段边界
+	// vmlinux.lds 中定义的
+	// `init_mm` 是内核第一个 mm_struct，属于内核本身的地址空间描述，不是用户进程。
+    init_mm.start_code = (unsigned long) &_text;
+    init_mm.end_code = (unsigned long) &_etext;
+    init_mm.end_data = (unsigned long) &_edata;
+    init_mm.brk = (unsigned long) &_end;  // `_end`：链接脚本符号，**内核镜像末尾虚拟地址**
 
-	code_resource.start = virt_to_bus(&_text);
-	code_resource.end = virt_to_bus(&_etext)-1;
-	data_resource.start = virt_to_bus(&_etext);
-	data_resource.end = virt_to_bus(&_edata)-1;
+    // 登记内核代码段、数据段的bus地址资源
+    code_resource.start = virt_to_bus(&_text);
+    code_resource.end = virt_to_bus(&_etext)-1;
+    data_resource.start = virt_to_bus(&_etext);
+    data_resource.end = virt_to_bus(&_edata)-1;
 
-	parse_mem_cmdline(cmdline_p);
+    // 解析cmdline，处理mem=xxx这类内存限制参数
+    parse_mem_cmdline(cmdline_p);
 
-#define PFN_UP(x)	(((x) + PAGE_SIZE-1) >> PAGE_SHIFT)
-#define PFN_DOWN(x)	((x) >> PAGE_SHIFT)
-#define PFN_PHYS(x)	((x) << PAGE_SHIFT)
+// 页号向上取整
+#define PFN_UP(x)   (((x) + PAGE_SIZE-1) >> PAGE_SHIFT)
+// 页号向下取整
+#define PFN_DOWN(x) ((x) >> PAGE_SHIFT)
+// 页号转物理地址
+#define PFN_PHYS(x) ((x) << PAGE_SHIFT)
 
 /*
  * 128MB for vmalloc and initrd
  */
-#define VMALLOC_RESERVE	(unsigned long)(128 << 20)
-#define MAXMEM		(unsigned long)(-PAGE_OFFSET-VMALLOC_RESERVE)
-#define MAXMEM_PFN	PFN_DOWN(MAXMEM)
-#define MAX_NONPAE_PFN	(1 << 20)
+#define VMALLOC_RESERVE (unsigned long)(128 << 20)
+#define MAXMEM      (unsigned long)(-PAGE_OFFSET-VMALLOC_RESERVE)
+#define MAXMEM_PFN  PFN_DOWN(MAXMEM)
+#define MAX_NONPAE_PFN  (1 << 20)
 
-	/*
-	 * partially used pages are not usable - thus
-	 * we are rounding upwards:
-	 */
-	start_pfn = PFN_UP(__pa(&_end));
+    /*
+     * partially used pages are not usable - thus
+     * we are rounding upwards:
+     */
+    // _end是内核镜像结束地址，算出内核镜像结束之后第一个可用页帧号
+    start_pfn = PFN_UP(__pa(&_end));
 
-	/*
-	 * Find the highest page frame number we have available
-	 */
-	max_pfn = 0;
-	for (i = 0; i < e820.nr_map; i++) {
-		unsigned long start, end;
-		/* RAM? */
-		if (e820.map[i].type != E820_RAM)
-			continue;
-		start = PFN_UP(e820.map[i].addr);
-		end = PFN_DOWN(e820.map[i].addr + e820.map[i].size);
-		if (start >= end)
-			continue;
-		if (end > max_pfn)
-			max_pfn = end;
-	}
+    /*
+     * Find the highest page frame number we have available
+     */
+    // 遍历e820，找到所有RAM里最大的pfn（全部物理内存上限）
+    max_pfn = 0;
+    for (i = 0; i < e820.nr_map; i++) {
+        unsigned long start, end;
+        /* RAM? */
+        if (e820.map[i].type != E820_RAM)
+            continue;
+        start = PFN_UP(e820.map[i].addr);
+        end = PFN_DOWN(e820.map[i].addr + e820.map[i].size);
+        if (start >= end)
+            continue;
+        if (end > max_pfn)
+            max_pfn = end;
+    }
 
-	/*
-	 * Determine low and high memory ranges:
-	 */
-	max_low_pfn = max_pfn;
-	if (max_low_pfn > MAXMEM_PFN) {
-		max_low_pfn = MAXMEM_PFN;
+    /*
+     * Determine low and high memory ranges:
+     */
+    // 区分低端内存、高端内存边界
+    max_low_pfn = max_pfn;
+    if (max_low_pfn > MAXMEM_PFN) {
+        max_low_pfn = MAXMEM_PFN;
 #ifndef CONFIG_HIGHMEM
-		/* Maximum memory usable is what is directly addressable */
-		printk(KERN_WARNING "Warning only %ldMB will be used.\n",
-					MAXMEM>>20);
-		if (max_pfn > MAX_NONPAE_PFN)
-			printk(KERN_WARNING "Use a PAE enabled kernel.\n");
-		else
-			printk(KERN_WARNING "Use a HIGHMEM enabled kernel.\n");
+        // 没有开启HIGHMEM，超出MAXMEM的内存无法使用
+        printk(KERN_WARNING "Warning only %ldMB will be used.\n",
+                MAXMEM>>20);
+        if (max_pfn > MAX_NONPAE_PFN)
+            printk(KERN_WARNING "Use a PAE enabled kernel.\n");
+        else
+            printk(KERN_WARNING "Use a HIGHMEM enabled kernel.\n");
 #else /* !CONFIG_HIGHMEM */
 #ifndef CONFIG_X86_PAE
-		if (max_pfn > MAX_NONPAE_PFN) {
-			max_pfn = MAX_NONPAE_PFN;
-			printk(KERN_WARNING "Warning only 4GB will be used.\n");
-			printk(KERN_WARNING "Use a PAE enabled kernel.\n");
-		}
+        // 未开启PAE，最多只能用到4GB
+        if (max_pfn > MAX_NONPAE_PFN) {
+            max_pfn = MAX_NONPAE_PFN;
+            printk(KERN_WARNING "Warning only 4GB will be used.\n");
+            printk(KERN_WARNING "Use a PAE enabled kernel.\n");
+        }
 #endif /* !CONFIG_X86_PAE */
 #endif /* !CONFIG_HIGHMEM */
-	}
+    }
 
 #ifdef CONFIG_HIGHMEM
-	highstart_pfn = highend_pfn = max_pfn;
-	if (max_pfn > MAXMEM_PFN) {
-		highstart_pfn = MAXMEM_PFN;
-		printk(KERN_NOTICE "%ldMB HIGHMEM available.\n",
-			pages_to_mb(highend_pfn - highstart_pfn));
-	}
+    // 开启HIGHMEM：高于MAXMEM_PFN的部分属于ZONE_HIGHMEM
+    highstart_pfn = highend_pfn = max_pfn;
+    if (max_pfn > MAXMEM_PFN) {
+        highstart_pfn = MAXMEM_PFN;
+        printk(KERN_NOTICE "%ldMB HIGHMEM available.\n",
+            pages_to_mb(highend_pfn - highstart_pfn));
+    }
 #endif
-	/*
-	 * Initialize the boot-time allocator (with low memory only):
-	 */
-	bootmap_size = init_bootmem(start_pfn, max_low_pfn);
+    /*
+     * Initialize the boot-time allocator (with low memory only):
+     */
+    // 初始化bootmem分配器，只管理低端内存，返回boot位图占用大小
+    bootmap_size = init_bootmem(start_pfn, max_low_pfn);
 
-	/*
-	 * Register fully available low RAM pages with the bootmem allocator.
-	 */
-	for (i = 0; i < e820.nr_map; i++) {
-		unsigned long curr_pfn, last_pfn, size;
- 		/*
-		 * Reserve usable low memory
-		 */
-		if (e820.map[i].type != E820_RAM)
-			continue;
-		/*
-		 * We are rounding up the start address of usable memory:
-		 */
-		curr_pfn = PFN_UP(e820.map[i].addr);
-		if (curr_pfn >= max_low_pfn)
-			continue;
-		/*
-		 * ... and at the end of the usable range downwards:
-		 */
-		last_pfn = PFN_DOWN(e820.map[i].addr + e820.map[i].size);
+    /*
+     * Register fully available low RAM pages with the bootmem allocator.
+     */
+    // 遍历e820，把低端内存里可用RAM释放给bootmem
+    for (i = 0; i < e820.nr_map; i++) {
+        unsigned long curr_pfn, last_pfn, size;
+        /*
+         * Reserve usable low memory
+         */
+        if (e820.map[i].type != E820_RAM)
+            continue;
+        /*
+         * We are rounding up the start address of usable memory:
+         */
+        curr_pfn = PFN_UP(e820.map[i].addr);
+        if (curr_pfn >= max_low_pfn)
+            continue;
+        /*
+         * ... and at the end of the usable range downwards:
+         */
+        last_pfn = PFN_DOWN(e820.map[i].addr + e820.map[i].size);
 
-		if (last_pfn > max_low_pfn)
-			last_pfn = max_low_pfn;
+        if (last_pfn > max_low_pfn)
+            last_pfn = max_low_pfn;
 
-		/*
-		 * .. finally, did all the rounding and playing
-		 * around just make the area go away?
-		 */
-		if (last_pfn <= curr_pfn)
-			continue;
+        /*
+         * .. finally, did all the rounding and playing
+         * around just make the area go away?
+         */
+        if (last_pfn <= curr_pfn)
+            continue;
 
-		size = last_pfn - curr_pfn;
-		free_bootmem(PFN_PHYS(curr_pfn), PFN_PHYS(size));
-	}
-	/*
-	 * Reserve the bootmem bitmap itself as well. We do this in two
-	 * steps (first step was init_bootmem()) because this catches
-	 * the (very unlikely) case of us accidentally initializing the
-	 * bootmem allocator with an invalid RAM area.
-	 */
-	reserve_bootmem(HIGH_MEMORY, (PFN_PHYS(start_pfn) +
-			 bootmap_size + PAGE_SIZE-1) - (HIGH_MEMORY));
+        size = last_pfn - curr_pfn;
+        free_bootmem(PFN_PHYS(curr_pfn), PFN_PHYS(size));
+    }
+    /*
+     * Reserve the bootmem bitmap itself as well. We do this in two
+     * steps (first step was init_bootmem()) because this catches
+     * the (very unlikely) case of us accidentally initializing the
+     * bootmem allocator with an invalid RAM area.
+     */
+    // 预留bootmem位图本身占用的内存，防止被分配出去
+    reserve_bootmem(HIGH_MEMORY, (PFN_PHYS(start_pfn) +
+            bootmap_size + PAGE_SIZE-1) - (HIGH_MEMORY));
 
-	/*
-	 * reserve physical page 0 - it's a special BIOS page on many boxes,
-	 * enabling clean reboots, SMP operation, laptop functions.
-	 */
-	reserve_bootmem(0, PAGE_SIZE);
+    /*
+     * reserve physical page 0 - it's a special BIOS page on many boxes,
+     * enabling clean reboots, SMP operation, laptop functions.
+     */
+    // 预留物理0页，BIOS专用
+    reserve_bootmem(0, PAGE_SIZE);
 
 #ifdef CONFIG_SMP
-	/*
-	 * But first pinch a few for the stack/trampoline stuff
-	 * FIXME: Don't need the extra page at 4K, but need to fix
-	 * trampoline before removing it. (see the GDT stuff)
-	 */
-	reserve_bootmem(PAGE_SIZE, PAGE_SIZE);
-	smp_alloc_memory(); /* AP processor realmode stacks in low memory*/
+    /*
+     * But first pinch a few for the stack/trampoline stuff
+     * FIXME: Don't need the extra page at 4K, but need to fix
+     * trampoline before removing it. (see the GDT stuff)
+     */
+    reserve_bootmem(PAGE_SIZE, PAGE_SIZE);
+    // 为SMP次核AP分配实模式栈、跳板内存
+    smp_alloc_memory(); /* AP processor realmode stacks in low memory*/
 #endif
 
 #ifdef CONFIG_X86_IO_APIC
-	/*
-	 * Find and reserve possible boot-time SMP configuration:
-	 */
-	find_smp_config();
+    /*
+     * Find and reserve possible boot-time SMP configuration:
+     */
+    find_smp_config();
 #endif
-	paging_init();
+    // 【关键】调用paging_init，构建内核页表、mem_map、zone、伙伴位图
+    paging_init();
 #ifdef CONFIG_X86_IO_APIC
-	/*
-	 * get boot-time SMP configuration:
-	 */
-	if (smp_found_config)
-		get_smp_config();
+    /*
+     * get boot-time SMP configuration:
+     */
+    if (smp_found_config)
+        get_smp_config();
 #endif
 #ifdef CONFIG_X86_LOCAL_APIC
-	init_apic_mappings();
+    // 初始化APIC虚拟映射
+    init_apic_mappings();
 #endif
 
 #ifdef CONFIG_BLK_DEV_INITRD
-	if (LOADER_TYPE && INITRD_START) {
-		if (INITRD_START + INITRD_SIZE <= (max_low_pfn << PAGE_SHIFT)) {
-			reserve_bootmem(INITRD_START, INITRD_SIZE);
-			initrd_start =
-				INITRD_START ? INITRD_START + PAGE_OFFSET : 0;
-			initrd_end = initrd_start+INITRD_SIZE;
-		}
-		else {
-			printk("initrd extends beyond end of memory "
-			    "(0x%08lx > 0x%08lx)\ndisabling initrd\n",
-			    INITRD_START + INITRD_SIZE,
-			    max_low_pfn << PAGE_SHIFT);
-			initrd_start = 0;
-		}
-	}
+    // 如果有initrd，把initrd区域预留，防止被分配
+    if (LOADER_TYPE && INITRD_START) {
+        if (INITRD_START + INITRD_SIZE <= (max_low_pfn << PAGE_SHIFT)) {
+            reserve_bootmem(INITRD_START, INITRD_SIZE);
+            initrd_start =
+                INITRD_START ? INITRD_START + PAGE_OFFSET : 0;
+            initrd_end = initrd_start+INITRD_SIZE;
+        }
+        else {
+            printk("initrd extends beyond end of memory "
+                "(0x%08lx > 0x%08lx)\ndisabling initrd\n",
+                INITRD_START + INITRD_SIZE,
+                max_low_pfn << PAGE_SHIFT);
+            initrd_start = 0;
+        }
+    }
 #endif
 
-	/*
-	 * Request address space for all standard RAM and ROM resources
-	 * and also for regions reported as reserved by the e820.
-	 */
-	probe_roms();
-	for (i = 0; i < e820.nr_map; i++) {
-		struct resource *res;
-		if (e820.map[i].addr + e820.map[i].size > 0x100000000ULL)
-			continue;
-		res = alloc_bootmem_low(sizeof(struct resource));
-		switch (e820.map[i].type) {
-		case E820_RAM:	res->name = "System RAM"; break;
-		case E820_ACPI:	res->name = "ACPI Tables"; break;
-		case E820_NVS:	res->name = "ACPI Non-volatile Storage"; break;
-		default:	res->name = "reserved";
-		}
-		res->start = e820.map[i].addr;
-		res->end = res->start + e820.map[i].size - 1;
-		res->flags = IORESOURCE_MEM | IORESOURCE_BUSY;
-		request_resource(&iomem_resource, res);
-		if (e820.map[i].type == E820_RAM) {
-			/*
-			 *  We dont't know which RAM region contains kernel data,
-			 *  so we try it repeatedly and let the resource manager
-			 *  test it.
-			 */
-			request_resource(res, &code_resource);
-			request_resource(res, &data_resource);
-		}
-	}
-	request_resource(&iomem_resource, &vram_resource);
+    /*
+     * Request address space for all standard RAM and ROM resources
+     * and also for regions reported as reserved by the e820.
+     */
+    // 扫描ROM，注册iomem资源
+    probe_roms();
+    for (i = 0; i < e820.nr_map; i++) {
+        struct resource *res;
+        if (e820.map[i].addr + e820.map[i].size > 0x100000000ULL)
+            continue;
+        res = alloc_bootmem_low(sizeof(struct resource));
+        switch (e820.map[i].type) {
+        case E820_RAM:  res->name = "System RAM"; break;
+        case E820_ACPI: res->name = "ACPI Tables"; break;
+        case E820_NVS:  res->name = "ACPI Non-volatile Storage"; break;
+        default:    res->name = "reserved";
+        }
+        res->start = e820.map[i].addr;
+        res->end = res->start + e820.map[i].size - 1;
+        res->flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+        request_resource(&iomem_resource, res);
+        if (e820.map[i].type == E820_RAM) {
+            /*
+             *  We dont't know which RAM region contains kernel data,
+             *  so we try it repeatedly and let the resource manager
+             *  test it.
+             */
+            request_resource(res, &code_resource);
+            request_resource(res, &data_resource);
+        }
+    }
+    request_resource(&iomem_resource, &vram_resource);
 
-	/* request I/O space for devices used on all i[345]86 PCs */
-	for (i = 0; i < STANDARD_IO_RESOURCES; i++)
-		request_resource(&ioport_resource, standard_io_resources+i);
+    // 注册PC标准IO端口资源（如串口、RTC等）
+    for (i = 0; i < STANDARD_IO_RESOURCES; i++)
+        request_resource(&ioport_resource, standard_io_resources+i);
 
 #ifdef CONFIG_VT
 #if defined(CONFIG_VGA_CONSOLE)
-	conswitchp = &vga_con;
+    conswitchp = &vga_con;
 #elif defined(CONFIG_DUMMY_CONSOLE)
-	conswitchp = &dummy_con;
+    conswitchp = &dummy_con;
 #endif
 #endif
 }
+
 
 #ifndef CONFIG_X86_TSC
 static int tsc_disable __initdata = 0;
@@ -2050,12 +2175,21 @@ void __init identify_cpu(struct cpuinfo_x86 *c)
  *	Perform early boot up checks for a valid TSC. See arch/i386/kernel/time.c
  */
  
+/**
+ * dodgy_tsc - 早期内核检测有缺陷TSC的CPU，做厂商特殊初始化
+ *
+ * 功能：读取CPU厂商信息，如果是Cyrix处理器，执行Cyrix专属初始化，处理Cyrix TSC存在的bug
+ * 约束：time_init早期调用，此时还没有完整的CPU bug检测流程
+ * 上下文：内核启动初始化上下文
+ */
 void __init dodgy_tsc(void)
 {
-	get_cpu_vendor(&boot_cpu_data);
-
-	if ( boot_cpu_data.x86_vendor == X86_VENDOR_CYRIX )
-		init_cyrix(&boot_cpu_data);
+    // 获取当前启动CPU的厂商信息，填充boot_cpu_data
+    get_cpu_vendor(&boot_cpu_data);
+    // 判断CPU厂商是否为Cyrix
+    if ( boot_cpu_data.x86_vendor == X86_VENDOR_CYRIX )
+        // Cyrix芯片TSC有硬件缺陷，执行Cyrix专属初始化，会关闭TSC相关能力
+        init_cyrix(&boot_cpu_data);
 }
 
 

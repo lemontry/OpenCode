@@ -167,48 +167,67 @@ sys_pipe (long arg0, long arg1, long arg2, long arg3,
   out:
 	return retval;
 }
-
+/**
+ * do_mmap2 - mmap系统调用核心包装函数，IA64平台，Linux2.4
+ * @addr: 用户指定期望映射起始虚拟地址
+ * @len: 映射区域长度（字节）
+ * @prot: 页面保护位 PROT_READ / PROT_WRITE / PROT_EXEC
+ * @flags: mmap标志位 MAP_SHARED / MAP_PRIVATE / MAP_ANONYMOUS / MAP_FIXED
+ * @fd: 文件描述符，匿名映射时传入-1
+ * @pgoff: 映射偏移，单位：页
+ * 返回值: 成功返回映射起始虚拟地址；失败返回负错误码
+ */
 static inline unsigned long
 do_mmap2 (unsigned long addr, unsigned long len, int prot, int flags, int fd, unsigned long pgoff)
 {
-	unsigned long roff;
-	struct file *file = 0;
+    unsigned long roff;
+    struct file *file = 0;
 
-	/*
-	 * A zero mmap always succeeds in Linux, independent of
-	 * whether or not the remaining arguments are valid.
-	 */
-	if (PAGE_ALIGN(len) == 0)
-		return addr;
+    /*
+     * A zero mmap always succeeds in Linux, independent of
+     * whether or not the remaining arguments are valid.
+     */
+    // 长度页对齐后为0，直接返回地址，空映射直接成功
+    if (PAGE_ALIGN(len) == 0)
+        return addr;
 
-	/* don't permit mappings into unmapped space or the virtual page table of a region: */
-	roff = rgn_offset(addr);
-	if ((len | roff | (roff + len)) >= RGN_MAP_LIMIT)
-		return -EINVAL;
+    /* don't permit mappings into unmapped space or the virtual page table of a region: */
+    // 计算地址在region内偏移，检查不能超出region映射上限
+    roff = rgn_offset(addr);
+    if ((len | roff | (roff + len)) >= RGN_MAP_LIMIT)
+        return -EINVAL;
 
-	/* don't permit mappings that would cross a region boundary: */
-	if (rgn_index(addr) != rgn_index(addr + len))
-		return -EINVAL;
+    /* don't permit mappings that would cross a region boundary: */
+    // 不允许映射跨region边界（IA64 region架构特性）
+    if (rgn_index(addr) != rgn_index(addr + len))
+        return -EINVAL;
 
-	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
-	if (!(flags & MAP_ANONYMOUS)) {
-		file = fget(fd);
-		if (!file)
-			return -EBADF;
-	}
+    // 清除已经废弃的标志位
+    flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+    // 非匿名映射：根据fd拿到struct file，增加引用计数
+    if (!(flags & MAP_ANONYMOUS)) {
+        file = fget(fd);
+        if (!file)
+            return -EBADF;
+    }
 
-	if (flags & MAP_SHARED)
-		current->thread.flags |= IA64_THREAD_MAP_SHARED;
+    // 标记当前线程存在共享映射（IA64平台特有标记）
+    if (flags & MAP_SHARED)
+        current->thread.flags |= IA64_THREAD_MAP_SHARED;
 
-	down(&current->mm->mmap_sem);
-	addr = do_mmap_pgoff(file, addr, len, prot, flags, pgoff);
-	up(&current->mm->mmap_sem);
+    // 获取mmap读写信号量，保护VMA链表、AVL树操作
+    down(&current->mm->mmap_sem);
+    // 真正的mmap实现，按页偏移创建VMA
+    addr = do_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+    up(&current->mm->mmap_sem);
 
-	current->thread.flags &= ~IA64_THREAD_MAP_SHARED;
+    // 清除共享映射标记
+    current->thread.flags &= ~IA64_THREAD_MAP_SHARED;
 
-	if (file)
-		fput(file);
-	return addr;
+    // 如果打开了文件，释放file引用计数
+    if (file)
+        fput(file);
+    return addr;
 }
 
 /*
@@ -228,20 +247,57 @@ sys_mmap2 (unsigned long addr, unsigned long len, int prot, int flags, int fd, l
 	return addr;
 }
 
+/**
+ * 
+ * 
+ptmalloc malloc(大于阈值)
+    ↓
+用户态libc mmap(...)
+    ↓ 触发系统调用
+sys_mmap(addr, len, prot, flags, fd, off,...)
+    ↓ 校验offset页对齐
+do_mmap2()          // IA64平台包装；x86是x86版本do_mmap2
+    ↓
+do_mmap_pgoff()     // 通用核心，地址空间检查、分配VMA
+    ↓
+insert_vm_struct()  // 插入VMA链表+AVL树
+    ↓ 返回虚拟地址给用户态
+
+一般使用： mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+
+ */
+
+/**
+ * sys_mmap - mmap系统调用入口，Linux2.4 x86
+ * @addr: 用户期望映射起始虚拟地址
+ * @len: 映射长度
+ * @prot: 内存保护属性 PROT_READ/PROT_WRITE/PROT_EXEC
+ * @flags: 映射标志 MAP_PRIVATE / MAP_SHARED / MAP_FIXED / MAP_ANONYMOUS
+ * @fd: 文件描述符，匿名映射传-1
+ * @off: 文件内偏移（字节）
+ * @arg6: 占位参数，x86系统调用栈对齐保留
+ * @arg7: 占位参数，x86系统调用栈对齐保留
+ * @stack: 栈指针，用来拿到pt_regs寄存器结构
+ * 返回值: 成功返回映射起始虚拟地址；失败返回负错误码
+ */
 asmlinkage unsigned long
 sys_mmap (unsigned long addr, unsigned long len, int prot, int flags,
-	  int fd, long off, long arg6, long arg7, long stack)
+      int fd, long off, long arg6, long arg7, long stack)
 {
-	struct pt_regs *regs = (struct pt_regs *) &stack;
+    struct pt_regs *regs = (struct pt_regs *) &stack;
 
-	if ((off & ~PAGE_MASK) != 0)
-		return -EINVAL;
+    // 偏移必须是页对齐，否则非法
+    if ((off & ~PAGE_MASK) != 0)
+        return -EINVAL;
 
-	addr = do_mmap2(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
-	if (!IS_ERR((void *) addr))
-		regs->r8 = 0;	/* ensure large addresses are not mistaken as failures... */
-	return addr;
+    // 转换成页为单位的偏移，调用do_mmap2核心逻辑
+    addr = do_mmap2(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+    // 如果调用成功，清空r8，避免高位地址被误判为错误码
+    if (!IS_ERR((void *) addr))
+        regs->r8 = 0;   /* ensure large addresses are not mistaken as failures... */
+    return addr;
 }
+
 
 asmlinkage long
 sys_vm86 (long arg0, long arg1, long arg2, long arg3)

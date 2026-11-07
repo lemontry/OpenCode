@@ -31,11 +31,18 @@ struct msqid_ds {
 /* Include the definition of msqid64_ds */
 #include <asm/msgbuf.h>
 
+/**
+ * struct msgbuf - 用户态传给msgsnd/msgrcv的消息缓冲区结构
+ * 这只是用户态约定的模板，内核不限制mtext的实际长度
+ */
 /* message buffer for msgsnd and msgrcv calls */
 struct msgbuf {
-	long mtype;         /* type of message */
-	char mtext[1];      /* message text */
+    // 消息类型，必须 > 0，msgrcv可以按类型过滤消息
+    long mtype;         /* type of message */
+    // 柔性数组（老式C写法，变长数据区），真正消息内容放在这里
+    char mtext[1];      /* message text */
 };
+
 
 /* buffer for msgctl calls IPC_INFO, MSG_INFO */
 struct msginfo {

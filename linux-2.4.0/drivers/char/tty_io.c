@@ -115,6 +115,8 @@ extern int rio_init(void);
 #define CHECK_TTY_COUNT 1
 
 struct termios tty_std_termios;		/* for the benefit of tty drivers  */
+
+//全局tty链表
 struct tty_driver *tty_drivers;		/* linked list of tty drivers */
 struct tty_ldisc ldiscs[NR_LDISCS];	/* line disc dispatch table	*/
 
@@ -1987,39 +1989,56 @@ void tty_default_put_char(struct tty_struct *tty, unsigned char ch)
 /*
  * Register a tty device described by <driver>, with minor number <minor>.
  */
+/**
+ * tty_register_devfs - 在devfs文件系统中注册单个tty设备节点
+ * @driver: 所属tty驱动的指针
+ * @flags: devfs注册标志位
+ * @minor: 需要注册的次设备号
+ * 返回值：无
+ */
 void tty_register_devfs (struct tty_driver *driver, unsigned int flags,
-			 unsigned int minor)
+             unsigned int minor)
 {
 #ifdef CONFIG_DEVFS_FS
-	umode_t mode = S_IFCHR | S_IRUSR | S_IWUSR;
-	struct tty_struct tty;
-	char buf[32];
+    // 设置默认文件模式：字符设备，所有者读写权限
+    umode_t mode = S_IFCHR | S_IRUSR | S_IWUSR;
+    // 临时tty结构体，用于辅助获取设备名称
+    struct tty_struct tty;
+    // 存放生成的设备名称字符串
+    char buf[32];
 
-	tty.driver = *driver;
-	tty.device = MKDEV (driver->major, minor);
-	switch (tty.device) {
-		case TTY_DEV:
-		case PTMX_DEV:
-			mode |= S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-			break;
-		default:
-			if (driver->major == PTY_MASTER_MAJOR)
-				flags |= DEVFS_FL_AUTO_OWNER;
-			break;
-	}
-	if ( (minor <  driver->minor_start) || 
-	     (minor >= driver->minor_start + driver->num) ) {
-		printk(KERN_ERR "Attempt to register invalid minor number "
-		       "with devfs (%d:%d).\n", (int)driver->major,(int)minor);
-		return;
-	}
+    // 拷贝驱动信息到临时tty结构体
+    tty.driver = *driver;
+    // 拼接完整设备号（主+次）
+    tty.device = MKDEV (driver->major, minor);
+    switch (tty.device) {
+        case TTY_DEV:
+        case PTMX_DEV:
+            // /dev/tty 和 /dev/ptmx 开放组和其他用户读写权限
+            mode |= S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+            break;
+        default:
+            // PTY master设备，添加自动归属标记
+            if (driver->major == PTY_MASTER_MAJOR)
+                flags |= DEVFS_FL_AUTO_OWNER;
+            break;
+    }
+    // 校验次设备号是否在当前驱动合法区间内
+    if ( (minor <  driver->minor_start) || 
+         (minor >= driver->minor_start + driver->num) ) {
+        printk(KERN_ERR "Attempt to register invalid minor number "
+               "with devfs (%d:%d).\n", (int)driver->major,(int)minor);
+        return;
+    }
 #  ifdef CONFIG_UNIX98_PTYS
-	if ( (driver->major >= UNIX98_PTY_SLAVE_MAJOR) &&
-	     (driver->major < UNIX98_PTY_SLAVE_MAJOR + UNIX98_NR_MAJORS) )
-		flags |= DEVFS_FL_CURRENT_OWNER;
+    // UNIX98 pty slave端，设置为当前进程作为属主
+    if ( (driver->major >= UNIX98_PTY_SLAVE_MAJOR) &&
+         (driver->major < UNIX98_PTY_SLAVE_MAJOR + UNIX98_NR_MAJORS) )
+        flags |= DEVFS_FL_CURRENT_OWNER;
 #  endif
-	devfs_register (NULL, tty_name (&tty, buf), flags | DEVFS_FL_DEFAULT,
-			driver->major, minor, mode, &tty_fops, NULL);
+    // 向dvefs注册设备节点
+    devfs_register (NULL, tty_name (&tty, buf), flags | DEVFS_FL_DEFAULT,
+            driver->major, minor, mode, &tty_fops, NULL);
 #endif /* CONFIG_DEVFS_FS */
 }
 
@@ -2046,34 +2065,46 @@ EXPORT_SYMBOL(tty_unregister_devfs);
 /*
  * Called by a tty driver to register itself.
  */
+/**
+ * tty_register_driver - 注册一个tty驱动到内核TTY子系统
+ * @driver: 待注册的tty_driver结构体指针
+ * 返回值：成功返回主设备号；失败返回负的错误码
+ */
 int tty_register_driver(struct tty_driver *driver)
 {
-	int error;
-        int i;
+    int error;
+    int i;
 
-	if (driver->flags & TTY_DRIVER_INSTALLED)
-		return 0;
+    // 判断驱动已经注册过，直接返回成功
+    if (driver->flags & TTY_DRIVER_INSTALLED)
+        return 0;
 
-	error = devfs_register_chrdev(driver->major, driver->name, &tty_fops);
-	if (error < 0)
-		return error;
-	else if(driver->major == 0)
-		driver->major = error;
+    // 注册字符设备，devfs方式，绑定tty_fops
+    error = devfs_register_chrdev(driver->major, driver->name, &tty_fops);
+    if (error < 0)
+        return error;
+    // major传0表示动态申请主设备号，把分配到的号回填到driver
+    else if(driver->major == 0)
+        driver->major = error;
 
-	if (!driver->put_char)
-		driver->put_char = tty_default_put_char;
-	
-	driver->prev = 0;
-	driver->next = tty_drivers;
-	if (tty_drivers) tty_drivers->prev = driver;
-	tty_drivers = driver;
-	
-	if ( !(driver->flags & TTY_DRIVER_NO_DEVFS) ) {
-		for(i = 0; i < driver->num; i++)
-		    tty_register_devfs(driver, 0, driver->minor_start + i);
-	}
-	proc_tty_register_driver(driver);
-	return error;
+    // 如果驱动没有提供put_char回调，赋值默认实现
+    if (!driver->put_char)
+        driver->put_char = tty_default_put_char;
+    
+    // 插入全局tty_driver双向链表头部
+    driver->prev = 0;
+    driver->next = tty_drivers;
+    if (tty_drivers) tty_drivers->prev = driver;
+    tty_drivers = driver;
+    
+    // 不禁止devfs时，循环注册每个次设备到devfs文件系统
+    if ( !(driver->flags & TTY_DRIVER_NO_DEVFS) ) {
+        for(i = 0; i < driver->num; i++)
+            tty_register_devfs(driver, 0, driver->minor_start + i);
+    }
+    // 在proc文件系统中注册该tty驱动信息
+    proc_tty_register_driver(driver);
+    return error;
 }
 
 /*
@@ -2207,6 +2238,7 @@ void __init console_init(void)
 
 static struct tty_driver dev_tty_driver, dev_syscons_driver;
 #ifdef CONFIG_UNIX98_PTYS
+//伪终端tty驱动
 static struct tty_driver dev_ptmx_driver;
 #endif
 #ifdef CONFIG_VT
@@ -2233,7 +2265,7 @@ void __init tty_init(void)
 	dev_tty_driver.driver_name = "/dev/tty";
 	dev_tty_driver.name = dev_tty_driver.driver_name + 5;
 	dev_tty_driver.name_base = 0;
-	dev_tty_driver.major = TTYAUX_MAJOR;
+	dev_tty_driver.major = TTYAUX_MAJOR;  //tty复制版本
 	dev_tty_driver.minor_start = 0;
 	dev_tty_driver.num = 1;
 	dev_tty_driver.type = TTY_DRIVER_TYPE_SYSTEM;

@@ -54,16 +54,28 @@ struct ipc_perm
 #define IPCMNI 32768  /* <= MAX_INT limit for ipc arrays (including sysctl changes) */
 
 /* used by in-kernel data structures */
+/**
+ * struct kern_ipc_perm - IPC权限控制核心结构
+ * 消息队列、信号量、共享内存都内嵌该结构体，保存键值、属主、权限、序列号
+ */
 struct kern_ipc_perm
 {
-	key_t		key;
-	uid_t		uid;
-	gid_t		gid;
-	uid_t		cuid;
-	gid_t		cgid;
-	mode_t		mode; 
-	unsigned long	seq;
+    // IPC键值，用户态调用msgget/semget/shmget传入的key
+    key_t       key;
+    // 属主用户ID
+    uid_t       uid;
+    // 属主组ID
+    gid_t       gid;
+    // 创建者用户ID
+    uid_t       cuid;
+    // 创建者组ID
+    gid_t       cgid;
+    // 文件访问权限位，rwx权限
+    mode_t      mode;
+    // 序列号，用于拼接对外ID，防止资源回收复用产生混淆
+    unsigned long   seq;
 };
+
 
 #endif /* __KERNEL__ */
 

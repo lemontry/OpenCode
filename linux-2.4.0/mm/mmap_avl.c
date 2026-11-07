@@ -161,29 +161,50 @@ static void avl_rebalance (struct vm_area_struct *** nodeplaces_ptr, int count)
 }
 
 /* Insert a node into a tree. */
+/**
+ * static inline void avl_insert (struct vm_area_struct * new_node, struct vm_area_struct ** ptree)
+ * @new_node: 待插入的vma节点
+ * @ptree: 树的根指针的地址（二级指针，方便修改根）
+ */
 static inline void avl_insert (struct vm_area_struct * new_node, struct vm_area_struct ** ptree)
 {
-	vm_avl_key_t key = new_node->vm_avl_key;
-	struct vm_area_struct ** nodeplace = ptree;
-	struct vm_area_struct ** stack[avl_maxheight];
-	int stack_count = 0;
-	struct vm_area_struct *** stack_ptr = &stack[0]; /* = &stack[stackcount] */
-	for (;;) {
-		struct vm_area_struct * node = *nodeplace;
-		if (node == vm_avl_empty)
-			break;
-		*stack_ptr++ = nodeplace; stack_count++;
-		if (key < node->vm_avl_key)
-			nodeplace = &node->vm_avl_left;
-		else
-			nodeplace = &node->vm_avl_right;
-	}
-	new_node->vm_avl_left = vm_avl_empty;
-	new_node->vm_avl_right = vm_avl_empty;
-	new_node->vm_avl_height = 1;
-	*nodeplace = new_node;
-	avl_rebalance(stack_ptr,stack_count);
+    vm_avl_key_t key = new_node->vm_avl_key;
+    struct vm_area_struct ** nodeplace = ptree;
+
+    // 回溯栈：保存查找路径上【父节点左右孩子指针的地址】，用来插入后往上更新高度、旋转平衡
+    struct vm_area_struct ** stack[avl_maxheight];
+    int stack_count = 0;
+    struct vm_area_struct *** stack_ptr = &stack[0]; /* = &stack[stackcount] */
+
+    // 1. 向下遍历，找到插入位置，沿途把分支指针压栈
+    for (;;) {
+        struct vm_area_struct * node = *nodeplace;
+        if (node == vm_avl_empty)
+            break;
+
+        // 保存当前分支指针（&node->vm_avl_left / &node->vm_avl_right）到栈
+        *stack_ptr++ = nodeplace;
+        stack_count++;
+
+        // AVL二叉搜索树比较逻辑
+        if (key < node->vm_avl_key)
+            nodeplace = &node->vm_avl_left;
+        else
+            nodeplace = &node->vm_avl_right;
+    }
+
+    // 2. 初始化新节点：叶子，左右空，高度=1
+    new_node->vm_avl_left = vm_avl_empty;
+    new_node->vm_avl_right = vm_avl_empty;
+    new_node->vm_avl_height = 1;
+
+    // 挂到找到的空位上
+    *nodeplace = new_node;
+
+    // 3. 沿着栈保存的路径回溯，更新高度 + AVL旋转重平衡
+    avl_rebalance(stack_ptr,stack_count);
 }
+
 
 /* Insert a node into a tree, and
  * return the node to the left of it and the node to the right of it.

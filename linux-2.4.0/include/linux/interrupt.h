@@ -11,14 +11,20 @@
 #include <asm/atomic.h>
 #include <asm/ptrace.h>
 
+// 驱动注册的中断动作节点，多个设备共享IRQ时串成单向链表
 struct irqaction {
-	void (*handler)(int, void *, struct pt_regs *);
-	unsigned long flags;
-	unsigned long mask;
-	const char *name;
-	void *dev_id;
-	struct irqaction *next;
+    // 驱动的中断服务处理函数
+    void (*handler)(int, void *, struct pt_regs *);
+    // 中断标志位，SA_SHIRQ代表共享中断
+    unsigned long flags;
+    // 设备名字，在/proc/interrupts展示
+    const char *name;
+    // 设备id，共享中断区分设备，释放中断时使用，共享中断不能为NULL
+    void *dev_id;
+    // 链表下一个节点
+    struct irqaction *next;
 };
+
 
 
 /* Who gets which entry in bh_base.  Things which will occur most often
@@ -53,27 +59,35 @@ enum {
    al. should be converted to tasklets, not to softirqs.
  */
 
+// Linux2.4 软中断编号枚举，定义各类softirq的向量下标，用于索引softirq_vec数组
+// 枚举编号越小，优先级越高。
+// `HI_SOFTIRQ(0) > NET_TX > NET_RX > TASKLET_SOFTIRQ`
+// `handle_softirq`遍历的时候**从 0 号开始依次扫描**，编号靠前优先执行。
+// 因此 `do_softirq` 中通过枚举值的大小，决定了优先级
 enum
 {
-	HI_SOFTIRQ=0,
-	NET_TX_SOFTIRQ,
-	NET_RX_SOFTIRQ,
-	TASKLET_SOFTIRQ
+    HI_SOFTIRQ=0,       // 高优先级tasklet软中断，优先级最高
+    NET_TX_SOFTIRQ,     // 网络发送软中断
+    NET_RX_SOFTIRQ,     // 网络接收软中断
+    TASKLET_SOFTIRQ     // 普通tasklet软中断
 };
+
 
 /* softirq mask and active fields moved to irq_cpustat_t in
  * asm/hardirq.h to get better cache usage.  KAO
  */
-
+// 软中断动作
 struct softirq_action
 {
-	void	(*action)(struct softirq_action *);
-	void	*data;
+    void (*action)(struct softirq_action *); // 软中断处理回调函数
+    void *data;                              // 传给回调的私有数据
 };
 
 asmlinkage void do_softirq(void);
 extern void open_softirq(int nr, void (*action)(struct softirq_action*), void *data);
 
+//设置标记位置
+// __softirq_active 位标志
 static inline void __cpu_raise_softirq(int cpu, int nr)
 {
 	softirq_active(cpu) |= (1<<nr);
@@ -81,16 +95,21 @@ static inline void __cpu_raise_softirq(int cpu, int nr)
 
 
 /* I do not want to use atomic variables now, so that cli/sti */
+//抛出软中断 
+// 网络网卡中断：收到包、发包完成 → raise_softirq(NET_RX_SOFTIRQ) / raise_softirq(NET_TX_SOFTIRQ)
+// 块设备中断：IO 完成，把后续的 bio 收尾交给软中断
+// 串口、声卡等设备：中断里只做硬件 ack，复杂的解析、缓冲处理丢软中断
+// tasklet_schedule() 里面最终会调用 raise_softirq(TASKLET_SOFTIRQ)。
 static inline void raise_softirq(int nr)
 {
-	unsigned long flags;
-
-	local_irq_save(flags);
-	__cpu_raise_softirq(smp_processor_id(), nr);
-	local_irq_restore(flags);
+    unsigned long flags;
+    local_irq_save(flags);          // 保存当前CPU的中断标志，同时关闭本地硬中断
+    __cpu_raise_softirq(smp_processor_id(), nr); // 在当前CPU标记nr号软中断pending
+    local_irq_restore(flags);       // 恢复原来的中断标志（恢复关/开中断状态）
 }
 
-extern void softirq_init(void);
+// 软中断子系统初始化函数声明，start_kernel里面调用
+extern void softirq_init(void);     
 
 
 
@@ -113,15 +132,23 @@ extern void softirq_init(void);
      wrt another tasklets. If client needs some intertask synchronization,
      he makes it with spinlocks.
  */
-
+// Linux2.4 tasklet结构体，tasklet是封装在softirq之上的下半部机制
 struct tasklet_struct
 {
-	struct tasklet_struct *next;
-	unsigned long state;
-	atomic_t count;
-	void (*func)(unsigned long);
-	unsigned long data;
+    // 链表指针，同一个CPU上待调度的tasklet串成单向链表
+	// 每个 CPU 维护一条 tasklet 链表；`tasklet_schedule`会把 tasklet 节点挂到当前 CPU 的 tasklet 链表。
+	//`tasklet_action`软中断处理函数遍历这个链表，挨个执行 func。
+    struct tasklet_struct *next;
+    // tasklet状态位图：TASKLET_STATE_SCHED(已挂起待执行)、TASKLET_STATE_RUN(正在运行)
+    unsigned long state;
+    // 引用计数，非0代表tasklet被禁用，不能执行
+    atomic_t count;
+    // tasklet业务处理回调函数
+    void (*func)(unsigned long);
+    // 传给func回调的自定义参数
+    unsigned long data;
 };
+
 
 #define DECLARE_TASKLET(name, func, data) \
 struct tasklet_struct name = { NULL, 0, ATOMIC_INIT(0), func, data }
@@ -154,32 +181,65 @@ extern struct tasklet_head tasklet_hi_vec[NR_CPUS];
 #define tasklet_unlock(t) do { } while (0)
 #endif
 
+/**
+ * tasklet_schedule - 把tasklet加入当前CPU的tasklet等待链表，触发TASKLET_SOFTIRQ软中断
+ * @t: 待调度的tasklet_struct结构体指针
+ *
+ * 功能：将tasklet标记为待执行，加入本CPU的tasklet链表，设置TASKLET_SOFTIRQ挂起标记
+ * 约束：同一个tasklet不会重复入队；tasklet在调用本函数的CPU上执行
+ * 上下文：支持硬中断上下文、进程上下文调用；回调函数不能睡眠
+ *  open_softirq(TASKLET_SOFTIRQ, tasklet_action, NULL);
+ */
 static inline void tasklet_schedule(struct tasklet_struct *t)
 {
-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state)) {
-		int cpu = smp_processor_id();
-		unsigned long flags;
+    // 原子测试并置位SCHED标记：未调度才进入分支，避免重复入队
+    if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state)) {
+        int cpu = smp_processor_id();
+        // 获取当前CPU编号
+        unsigned long flags;
 
-		local_irq_save(flags);
-		t->next = tasklet_vec[cpu].list;
-		tasklet_vec[cpu].list = t;
-		__cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
-		local_irq_restore(flags);
-	}
+        // 保存中断标志，关闭本地硬中断，保护链表临界区
+        local_irq_save(flags);
+        // 头插法：新节点next指向原链表头
+        t->next = tasklet_vec[cpu].list;
+        // 更新链表头，挂载当前tasklet
+        tasklet_vec[cpu].list = t;
+        // 置位TASKLET_SOFTIRQ软中断pending位
+        __cpu_raise_softirq(cpu, TASKLET_SOFTIRQ);
+        // 恢复本地中断状态
+        local_irq_restore(flags);
+    }
 }
 
+/**
+ * tasklet_hi_schedule - 调度高优先级tasklet，触发HI_SOFTIRQ软中断
+ * @t: 待调度的tasklet_struct结构体指针
+ *
+ * 功能：将高优先级tasklet加入当前CPU高优先级tasklet链表，标记HI_SOFTIRQ软中断pending
+ * 约束：同一个tasklet不会重复入队；在调用该函数的CPU上执行
+ * 上下文：可在硬中断/进程上下文调用；tasklet回调禁止睡眠
+ * 区别：相比普通tasklet_schedule，使用HI_SOFTIRQ，优先级高于TASKLET_SOFTIRQ
+ *  open_softirq(HI_SOFTIRQ, tasklet_hi_action, NULL);
+ */
 static inline void tasklet_hi_schedule(struct tasklet_struct *t)
 {
-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state)) {
-		int cpu = smp_processor_id();
-		unsigned long flags;
+    // 原子测试并置位SCHED标记：未调度才进入分支，防止重复入队
+    if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state)) {
+        int cpu = smp_processor_id();
+        // 获取当前CPU编号
+        unsigned long flags;
 
-		local_irq_save(flags);
-		t->next = tasklet_hi_vec[cpu].list;
-		tasklet_hi_vec[cpu].list = t;
-		__cpu_raise_softirq(cpu, HI_SOFTIRQ);
-		local_irq_restore(flags);
-	}
+        // 保存中断标志，关闭本地硬中断，保护高优先级tasklet链表操作
+        local_irq_save(flags);
+        // 头插法：当前节点next指向原有链表头部
+        t->next = tasklet_hi_vec[cpu].list;
+        // 更新链表头，挂载高优先级tasklet
+        tasklet_hi_vec[cpu].list = t;
+        // 置位HI_SOFTIRQ高优先级软中断pending位
+        __cpu_raise_softirq(cpu, HI_SOFTIRQ);
+        // 恢复本地CPU原始中断状态
+        local_irq_restore(flags);
+    }
 }
 
 
@@ -231,6 +291,7 @@ extern spinlock_t global_bh_lock;
 
 static inline void mark_bh(int nr)
 {
+	// 主要是 bh_action
 	tasklet_hi_schedule(bh_task_vec+nr);
 }
 

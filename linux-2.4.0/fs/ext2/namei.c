@@ -383,30 +383,50 @@ static int ext2_create (struct inode * dir, struct dentry * dentry, int mode)
 	return 0;
 }
 
+/**
+ * ext2_mknod - ext2文件系统mknod回调函数，vfs_mknod最终调用到这里
+ * @dir: 父目录inode
+ * @dentry: 待创建节点对应的dentry（d_inode == NULL）
+ * @mode: 文件类型+权限（S_IFIFO / S_IFCHR / S_IFBLK / S_IFSOCK）
+ * @rdev: 设备号，FIFO时传0，字符/块设备是主次设备号
+ *
+ * 作用：在ext2上创建特殊inode：FIFO、字符设备、块设备、socket
+ */
 static int ext2_mknod (struct inode * dir, struct dentry *dentry, int mode, int rdev)
 {
-	struct inode * inode = ext2_new_inode (dir, mode);
-	int err = PTR_ERR(inode);
+    // 1. 在ext2分配一个新的inode（从ext2 inode位图找空闲inode）
+    struct inode * inode = ext2_new_inode (dir, mode);
+    int err = PTR_ERR(inode);
 
-	if (IS_ERR(inode))
-		return err;
+    // 分配inode失败（磁盘满、没有空闲inode）直接返回错误码
+    if (IS_ERR(inode))
+        return err;
 
-	inode->i_uid = current->fsuid;
-	init_special_inode(inode, mode, rdev);
-	err = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len, 
-			     inode);
-	if (err)
-		goto out_no_entry;
-	mark_inode_dirty(inode);
-	d_instantiate(dentry, inode);
-	return 0;
+    // 设置inode属主UID
+    inode->i_uid = current->fsuid;
+    // 【重点】初始化特殊文件inode，挂载对应的文件操作表def_fifo_fops等
+    init_special_inode(inode, mode, rdev);
+
+    // 2. 在父目录块里添加目录项：名字 <--> inode号 的映射（写磁盘目录块）
+    err = ext2_add_entry (dir, dentry->d_name.name, dentry->d_name.len, inode);
+    if (err)
+        goto out_no_entry;
+
+    // inode内容变更，标记为脏inode，后续回写到磁盘
+    mark_inode_dirty(inode);
+    // 绑定dentry和inode：dentry->d_inode = inode，完成实例化
+    d_instantiate(dentry, inode);
+    return 0;
 
 out_no_entry:
-	inode->i_nlink--;
-	mark_inode_dirty(inode);
-	iput(inode);
-	return err;
+    // 添加目录项失败（磁盘块满等），回滚：链接计数减一
+    inode->i_nlink--;
+    mark_inode_dirty(inode);
+    // 释放这个刚分配的inode
+    iput(inode);
+    return err;
 }
+
 
 static int ext2_mkdir(struct inode * dir, struct dentry * dentry, int mode)
 {

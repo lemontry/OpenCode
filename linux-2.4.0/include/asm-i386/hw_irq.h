@@ -149,6 +149,30 @@ SYMBOL_NAME_STR(x) ":\n\t" \
 	"addl $4,%esp\n\t" \
 	"jmp ret_from_intr\n");
 
+/**
+展开之后：
+// 函数声明
+asmlinkage void call_do_IRQ(void);
+
+__asm__ (
+"\n.align 4\n"
+"common_interrupt:\n\t"
+    // SAVE_ALL 展开：压入所有寄存器 eax,ebx,ecx,edx,esi,edi,ebp,ds,es 等，构造pt_regs栈帧
+    "pushl %ds\n\t"
+    "pushl %es\n\t"
+    "pushl %eax\n\t"
+    "pushl %ebp\n\t"
+    "pushl %edi\n\t"
+    "pushl %esi\n\t"
+    "pushl %edx\n\t"
+    "pushl %ecx\n\t"
+    "pushl %ebx\n\t"
+    // 上面这一堆就是 SAVE_ALL
+    "pushl $ret_from_intr\n\t"
+"call_do_IRQ:\n\t"
+    "jmp do_IRQ"
+);
+*/
 #define BUILD_COMMON_IRQ() \
 asmlinkage void call_do_IRQ(void); \
 __asm__( \
@@ -169,6 +193,10 @@ __asm__( \
  * Subtle as a pigs ear.  VY
  */
 
+// Linux2.4 x86-32 宏，批量生成每个IRQ对应的中断入口汇编桩函数
+// asmlinkage void IRQ5_interrupt();  给 C 编译器声明这个汇编符号，C 代码里可以取它的地址。
+// asmlinkage void IRQ5_interrupt();
+// __asm__(".align 4\nIRQ5_interrupt:\n\tpushl $5-256\n\tjmp common_interrupt");
 #define BUILD_IRQ(nr) \
 asmlinkage void IRQ_NAME(nr); \
 __asm__( \

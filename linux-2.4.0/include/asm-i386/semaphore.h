@@ -41,11 +41,19 @@
 #include <asm/rwlock.h>
 #include <linux/wait.h>
 
+/**
+ * struct semaphore - Linux 2.4 内核信号量（睡眠锁，不是自旋锁）
+ */
 struct semaphore {
+	// 资源计数，正数代表可用资源；0 代表无资源；负数代表有进程在等待
 	atomic_t count;
+	// 记录当前正在这个信号量上睡眠等待的进程数量
 	int sleepers;
+
+	// 等待队列头，所有阻塞在该信号量上的进程挂在这个等待队列
 	wait_queue_head_t wait;
 #if WAITQUEUE_DEBUG
+	// 调试用魔数，开启WAITQUEUE_DEBUG才存在，用来检测结构体损坏
 	long __magic;
 #endif
 };
@@ -111,25 +119,37 @@ asmlinkage void __up(struct semaphore * sem);
  * "__down_failed" is a special asm handler that calls the C
  * routine that actually waits. See arch/i386/kernel/semaphore.c
  */
+/**
+ * down - 获取信号量，不可中断（Linux2.4 x86）
+ * @sem: 信号量结构体指针
+ * 作用：申请信号量资源；资源充足直接返回；资源不足进入睡眠等待
+ * 是自旋锁之外的内核同步原语，会让出CPU，不是忙等
+ */
 static inline void down(struct semaphore * sem)
 {
 #if WAITQUEUE_DEBUG
-	CHECK_MAGIC(sem->__magic);
+    // 调试：校验信号量magic魔数，检测内存损坏
+    CHECK_MAGIC(sem->__magic);
 #endif
-
-	__asm__ __volatile__(
-		"# atomic down operation\n\t"
-		LOCK "decl %0\n\t"     /* --sem->count */
-		"js 2f\n"
-		"1:\n"
-		".section .text.lock,\"ax\"\n"
-		"2:\tcall __down_failed\n\t"
-		"jmp 1b\n"
-		".previous"
-		:"=m" (sem->count)
-		:"c" (sem)
-		:"memory");
+    __asm__ __volatile__(
+        "# atomic down operation\n\t"
+        // LOCK：总线锁，保证SMP下原子操作；decl 自减1：sem->count--
+        LOCK "decl %0\n\t"
+        // js：符号标志位=1则跳转。如果count减完变成负数 → 资源不够，跳转到2标号
+        "js 2f\n"
+        // 减完 >=0，资源充足，走到1标号，直接退出，拿到信号量
+        "1:\n"
+        ".section .text.lock,\"ax\"\n"
+        // 资源不足，调用C函数 __down_failed 进入等待队列睡眠
+        "2:\tcall __down_failed\n\t"
+        // 从__down_failed唤醒返回后，跳回1，直接退出
+        "jmp 1b\n"
+        ".previous"
+        :"=m" (sem->count)
+        :"c" (sem)
+        :"memory");
 }
+
 
 static inline int down_interruptible(struct semaphore * sem)
 {
@@ -185,23 +205,36 @@ static inline int down_trylock(struct semaphore * sem)
  * The default case (no contention) will result in NO
  * jumps for both down() and up().
  */
+/**
+ * up - 释放信号量（Linux2.4 x86）
+ * @sem: 信号量指针
+ * 功能：归还信号量资源；如果有进程正在等待，则触发唤醒逻辑
+ */
 static inline void up(struct semaphore * sem)
 {
 #if WAITQUEUE_DEBUG
-	CHECK_MAGIC(sem->__magic);
+    // 调试：校验信号量magic，检测内存损坏
+    CHECK_MAGIC(sem->__magic);
 #endif
-	__asm__ __volatile__(
-		"# atomic up operation\n\t"
-		LOCK "incl %0\n\t"     /* ++sem->count */
-		"jle 2f\n"
-		"1:\n"
-		".section .text.lock,\"ax\"\n"
-		"2:\tcall __up_wakeup\n\t"
-		"jmp 1b\n"
-		".previous"
-		:"=m" (sem->count)
-		:"c" (sem)
-		:"memory");
+    __asm__ __volatile__(
+        "# atomic up operation\n\t"
+        // LOCK总线锁，原子执行 incl：sem->count++
+        LOCK "incl %0\n\t"
+        // jle：小于等于0则跳转到标号2
+        "jle 2f\n"
+        // count > 0，没有等待进程，直接走到标号1，返回
+        "1:\n"
+        // 把失败唤醒分支放到独立section，优化cache局部性
+        ".section .text.lock,\"ax\"\n"
+        // count <= 0，说明存在等待进程，调用__up_wakeup执行唤醒
+        "2:\tcall __up_wakeup\n\t"
+        // 唤醒函数返回后跳到标号1，结束
+        "jmp 1b\n"
+        // 切回原来的代码段
+        ".previous"
+        :"=m" (sem->count)
+        :"c" (sem)       // 输入约束：把sem指针放到ecx，__up_wakeup从ecx取参数
+        :"memory");      // 内存屏障，禁止编译器对这块汇编前后内存访问重排
 }
 
 /* rw mutexes (should that be mutices? =) -- throw rw

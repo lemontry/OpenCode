@@ -110,6 +110,55 @@ extern int last_pid;
 /*
  * Scheduling policies
  */
+
+ /*
+ ## 1. SCHED_OTHER（普通分时进程，默认策略）
+
+全称：SCHED_OTHER，**普通分时调度（非实时）**
+
+- 适用：绝大多数用户进程，bash、gcc、应用程序默认都是这个
+- 优先级：由 `nice` 值决定（nice 范围 -20 ~ +19），换算成初始时间片 `counter`
+- 规则：
+  1. 用`counter`作为剩余时间片，时钟中断里不断减`counter`；counter=0，时间片耗尽。
+  2. `goodness()`打分，counter 越大分数越高，优先被选中运行。
+  3. 所有就绪进程 counter 全部耗尽 → 触发`recalculate`，**全局遍历所有任务重新计算 counter**。
+  4. 不支持抢占：同是 SCHED_OTHER，高 nice 只是时间片更长；一个 SCHED_OTHER 进程正在运行，另一个 SCHED_OTHER 就绪，不会主动抢占，等时间片用完或主动 sleep。
+
+> 
+> 注意：**SCHED_OTHER 没有实时优先级（rt_priority）**
+
+## 2. SCHED_FIFO 实时策略（先进先出）
+
+全称：SCHED_FIFO = First In First Out，**实时 FIFO**
+
+- 属于**实时进程**，优先级 `rt_priority`（1~99，数字越大优先级越高）
+- 规则：
+  1. 只要 CPU 上有就绪的 FIFO 实时任务，**一定会优先于 SCHED_OTHER**运行。
+  2. 高 rt_priority 就绪任务一旦就绪，**立刻抢占低优先级任务**。
+  3. **没有时间片！** 一旦拿到 CPU 就一直跑，直到：
+     - 主动 sleep（等待信号 / IO），主动让出 CPU；
+     - 更高优先级实时任务就绪，被抢占。
+  4. 同优先级 SCHED_FIFO：先就绪先运行，不轮换；不自动让出 CPU。
+
+> 
+> 风险：如果一个 FIFO 死循环、不睡眠，同优先级 / 低优先级任务会永久饿死。
+
+## 3. SCHED_RR 实时策略（Round Robin 实时轮询）
+
+全称：SCHED_RR = Round-Robin，**实时轮询**
+
+- 同样是**实时进程**，`rt_priority`（1~99，越大优先级越高），优先级高于 SCHED_OTHER
+- 和 FIFO 几乎一样，唯一差别：**带时间片**
+
+1. 高优先级抢占低优先级；
+2. 同优先级 RR 任务：进程拿到 CPU，运行到**时间片耗尽**；
+3. 时间片用完：内核把它移动到就绪队列**同优先级组的队尾**（就是前面看到的`move_last_runqueue()`），调度同优先级下一个就绪 RR 任务；
+4. 如果进程主动 sleep，时间片不会被消耗。
+
+> 
+> 一句话区分 FIFO 与 RR：
+> 同优先级：FIFO 一旦上 CPU 就一直跑；RR 有时间片，时间片用完同优先级轮换。
+ */
 #define SCHED_OTHER		0
 #define SCHED_FIFO		1
 #define SCHED_RR		2
@@ -221,30 +270,56 @@ struct files_struct {
 /* Number of map areas at which the AVL tree is activated. This is arbitrary. */
 #define AVL_MIN_MAP_COUNT	32
 
+/**
+ * mm_struct - 进程内存描述符，代表一个独立的用户地址空间，Linux 2.4
+ */
 struct mm_struct {
-	struct vm_area_struct * mmap;		/* list of VMAs */
-	struct vm_area_struct * mmap_avl;	/* tree of VMAs */
-	struct vm_area_struct * mmap_cache;	/* last find_vma result */
-	pgd_t * pgd;
-	atomic_t mm_users;			/* How many users with user space? */
-	atomic_t mm_count;			/* How many references to "struct mm_struct" (users count as 1) */
-	int map_count;				/* number of VMAs */
-	struct semaphore mmap_sem;
-	spinlock_t page_table_lock;
+    // VMA链表头
+    struct vm_area_struct * mmap;       /* list of VMAs */
+    // VMA的AVL树根节点，用于快速查找
+    struct vm_area_struct * mmap_avl;   /* tree of VMAs */
+    // find_vma缓存，保存最近一次查到的vma，加速查找
+    struct vm_area_struct * mmap_cache; /* last find_vma result */
+    // 页全局目录PGD指针，切换地址空间时填入CR3
+    pgd_t * pgd;
+    // 用户计数：正在使用该地址空间的任务数
+    atomic_t mm_users;            /* How many users with user space? */
+    // mm结构体本身引用计数，mm_users是其中一类引用
+    atomic_t mm_count;            /* How many references to "struct mm_struct" (users count as 1) */
+    // 当前VMA总数量
+    int map_count;                /* number of VMAs */
+    // 保护VMA增删、地址空间修改的信号量
+    struct semaphore mmap_sem;
+    // 页表修改操作的自旋锁
+    spinlock_t page_table_lock;
 
-	struct list_head mmlist;		/* List of all active mm's */
+    // 全局链表节点，把所有存活mm串起来
+    struct list_head mmlist;          /* List of all active mm's */
 
-	unsigned long start_code, end_code, start_data, end_data;
-	unsigned long start_brk, brk, start_stack;
-	unsigned long arg_start, arg_end, env_start, env_end;
-	unsigned long rss, total_vm, locked_vm;
-	unsigned long def_flags;
-	unsigned long cpu_vm_mask;
-	unsigned long swap_cnt;	/* number of pages to swap on next pass */
-	unsigned long swap_address;
+    // 代码段起止
+    unsigned long start_code, end_code;
+    // 数据段起止
+    unsigned long start_data, end_data;
+    // 堆起始、当前堆顶、栈起始
+    unsigned long start_brk, brk, start_stack;
+    // 命令行参数区间
+    unsigned long arg_start, arg_end;
+    // 环境变量区间
+    unsigned long env_start, env_end;
+    // rss：常驻内存页数；total_vm：总虚拟页数；locked_vm：锁定不换出页数
+    unsigned long rss, total_vm, locked_vm;
+    // VMA默认保护标志
+    unsigned long def_flags;
+    // CPU掩码，用于tlb刷新
+    unsigned long cpu_vm_mask;
+    // 换出扫描计数
+    unsigned long swap_cnt; /* number of pages to swap on next pass */
+    // swap扫描地址游标
+    unsigned long swap_address;
 
-	/* Architecture-specific MM context */
-	mm_context_t context;
+    /* Architecture-specific MM context */
+    // 架构相关mm上下文，x86下存放LDT等
+    mm_context_t context;
 };
 
 #define INIT_MM(name) \
@@ -748,9 +823,15 @@ extern void free_uid(struct user_struct *);
 
 #include <asm/current.h>
 
+// 全局节拍计数，volatile防止编译器优化，每次定时器中断自增
+// jiffies：内核节拍计数器，系统启动后每触发一次定时器中断(PIT IRQ0) +1
 extern unsigned long volatile jiffies;
+// 间隔定时器剩余节拍数
 extern unsigned long itimer_ticks;
+// 下一次间隔定时器到期的jiffies值
 extern unsigned long itimer_next;
+// 内核墙上时间，tv_sec是从Epoch(1970-01-01)开始的秒数，tv_usec微秒，gettimeofday读取的源头
+// x：来自 x-kernel（当年一个经典操作系统研究内核）
 extern struct timeval xtime;
 extern void do_timer(struct pt_regs *);
 
@@ -965,6 +1046,12 @@ extern void FASTCALL(add_wait_queue(wait_queue_head_t *q, wait_queue_t * wait));
 extern void FASTCALL(add_wait_queue_exclusive(wait_queue_head_t *q, wait_queue_t * wait));
 extern void FASTCALL(remove_wait_queue(wait_queue_head_t *q, wait_queue_t * wait));
 
+/**
+ * __wait_event - wait_event 的底层实现宏，不可中断等待 (Linux2.4)
+ * @wq: 等待队列头 wait_queue_head_t *
+ * @condition: 等待的布尔条件
+ * 注意：节点定义在栈上，唤醒后循环检查条件，处理虚假唤醒
+ */
 #define __wait_event(wq, condition) 					\
 do {									\
 	wait_queue_t __wait;						\
@@ -981,13 +1068,27 @@ do {									\
 	remove_wait_queue(&wq, &__wait);				\
 } while (0)
 
-#define wait_event(wq, condition) 					\
-do {									\
-	if (condition)	 						\
-		break;							\
-	__wait_event(wq, condition);					\
+/**
+ * wait_event - 不可中断等待，条件不满足则睡眠(Linux2.4)
+ * @wq: wait_queue_head_t * 等待队列头
+ * @condition: C布尔条件表达式
+ * 语义：条件成立直接跳过等待；不成立，进入底层__wait_event循环睡眠
+ * 特点：TASK_UNINTERRUPTIBLE，不能被信号唤醒，只能被wake_up唤醒
+ */
+#define wait_event(wq, condition)                     \
+do {                                                  \
+    if (condition)                                    \
+        break;                                        \
+    __wait_event(wq, condition);                      \
 } while (0)
 
+/**
+ * __wait_event_interruptible - wait_event_interruptible底层宏，可中断等待(Linux2.4)
+ * @wq: 等待队列头 wait_queue_head_t *
+ * @condition: 等待的布尔条件
+ * @ret: 传出返回值，条件满足ret=0；收到信号ret=-ERESTARTSYS
+ * 特点：TASK_INTERRUPTIBLE，可被信号唤醒，是pipe、信号量down_interruptible核心底层
+ */
 #define __wait_event_interruptible(wq, condition, ret)			\
 do {									\
 	wait_queue_t __wait;						\
@@ -1054,6 +1155,7 @@ do {									\
 #define next_thread(p) \
 	list_entry((p)->thread_group.next, struct task_struct, thread_group)
 
+//从就绪队列中移除
 static inline void del_from_runqueue(struct task_struct * p)
 {
 	nr_running--;

@@ -20,13 +20,17 @@ SECTIONS
   .rodata : { *(.rodata) }
   .kstrtab : { *(.kstrtab) }
 
+//异常表
   . = ALIGN(16);		/* Exception table */
   __start___ex_table = .;
   __ex_table : { *(__ex_table) }
   __stop___ex_table = .;
 
+//`.` 是链接脚本内置变量：**当前地址计数器（location counter）**
+// 把**当前内存地址**赋值给符号 `__start___ksymtab`
+// 代表 `__ksymtab` 段**起始地址**
   __start___ksymtab = .;	/* Kernel symbol table */
-  __ksymtab : { *(__ksymtab) }
+  __ksymtab : { *(__ksymtab) }   //定义一个段名
   __stop___ksymtab = .;
 
   .data : {			/* Data */

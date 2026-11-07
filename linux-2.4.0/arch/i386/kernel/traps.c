@@ -228,37 +228,66 @@ static inline unsigned long get_cr2(void)
 	return address;
 }
 
+/**
+ * static void inline do_trap(int trapnr, int signr, char *str, int vm86,
+ *              struct pt_regs * regs, long error_code, siginfo_t *info)
+ * Linux2.4 arch/i386/kernel/traps.c
+ * @trapnr: 异常向量号，int3就是3
+ * @signr: 要发送给进程的信号，int3对应SIGTRAP
+ * @str: 异常名字字符串，用于die()打印崩溃信息
+ * @vm86: 是否支持vm86虚拟机模式标记，int3传入1
+ * @regs: pt_regs栈帧，保存被打断现场
+ * @error_code: 硬件错误码
+ * @info: siginfo附加信号信息，NULL代表使用默认
+ *
+ * 公共异常处理函数，DO_TRAP宏生成的各个do_xxx异常函数都会调用它
+ * 逻辑分支：vm86模式异常 / 用户态异常 / 内核态异常
+ * `do_trap` 只用于 **CPU 异常（trap/fault：#0 除零、#3 int3、#PF 缺页、#GP 保护异常这类）**。
+ */
 static void inline do_trap(int trapnr, int signr, char *str, int vm86,
 			   struct pt_regs * regs, long error_code, siginfo_t *info)
 {
+	// 判断：是否是vm86实模式虚拟机，并且eflags里VM虚拟机标记置位
 	if (vm86 && regs->eflags & VM_MASK)
 		goto vm86_trap;
+	
+	// regs->xcs & 3：取cs段寄存器最低2bit，即CPL特权级
+    // !(regs->xcs &3) → CPL=0，代表异常发生在内核态，跳内核异常分支
 	if (!(regs->xcs & 3))
 		goto kernel_trap;
 
+	//当前在用户态代码发现了CPU异常
+	// 用户态的异常，通过信号来处理，例如SIGTRAP等
 	trap_signal: {
+		// 用户态触发异常：向当前进程投递信号
 		struct task_struct *tsk = current;
+		// 把本次异常信息保存到进程thread结构，方便信号处理时读取
 		tsk->thread.error_code = error_code;
 		tsk->thread.trap_no = trapnr;
+
+		//DO_ERROR_INFO 这些宏才有info信号附加信息
 		if (info)
-			force_sig_info(signr, info, tsk);
+			force_sig_info(signr, info, tsk);  // 带详细siginfo信息发送信号
 		else
-			force_sig(signr, tsk);
+			force_sig(signr, tsk);  // 发送基础信号，int3走这个分支，发送SIGTRAP
 		return;
 	}
 
+	//当前在内核态的代码出现了CPU异常
 	kernel_trap: {
+		// 内核代码内部触发异常：搜索异常修复表（exception table）
 		unsigned long fixup = search_exception_table(regs->eip);
 		if (fixup)
-			regs->eip = fixup;
+			regs->eip = fixup;  // 找到修复地址，修改eip，跳转到修复代码，内核不崩溃
 		else	
-			die(str, regs, error_code);
+			die(str, regs, error_code);  // 没有修复入口，内核崩溃，打印调用栈，die()
 		return;
 	}
 
 	vm86_trap: {
+		// vm86虚拟机模式下的异常处理（老DOS虚拟机
 		int ret = handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code, trapnr);
-		if (ret) goto trap_signal;
+		if (ret) goto trap_signal;  // vm86处理完后，仍然需要给进程发信号
 		return;
 	}
 }
@@ -297,6 +326,8 @@ asmlinkage void do_##name(struct pt_regs * regs, long error_code) \
 	do_trap(trapnr, signr, str, 1, regs, error_code, &info); \
 }
 
+//中断函数的声明
+//函数声明
 DO_VM86_ERROR_INFO( 0, SIGFPE,  "divide error", divide_error, FPE_INTDIV, regs->eip)
 DO_VM86_ERROR( 3, SIGTRAP, "int3", int3)
 DO_VM86_ERROR( 4, SIGSEGV, "overflow", overflow)
@@ -785,17 +816,27 @@ void __init trap_init_f00f_bug(void)
 }
 #endif
 
+/**
+ * #define _set_gate(gate_addr,type,dpl,addr)
+ * Linux2.4 x86 宏：填充IDT/GDT的门描述符（中断门/陷阱门/系统门底层公共实现）
+ * @gate_addr: 门描述符的内存地址，IDT表项地址
+ * @type: 门类型，x86保护模式门描述符type字段
+ * @dpl: 描述符特权级 0~3，DPL=0内核态，DPL=3用户态可访问
+ * @addr: 中断/异常处理函数的虚拟地址（如 &page_fault、&system_call）
+ * 这是底层原始宏，set_trap_gate / set_intr_gate / set_system_gate 全部基于 _set_gate 封装
+ * 嵌入式汇编，do-while(0) 标准宏写法，避免语法问题
+ */
 #define _set_gate(gate_addr,type,dpl,addr) \
 do { \
   int __d0, __d1; \
   __asm__ __volatile__ ("movw %%dx,%%ax\n\t" \
-	"movw %4,%%dx\n\t" \
-	"movl %%eax,%0\n\t" \
-	"movl %%edx,%1" \
-	:"=m" (*((long *) (gate_addr))), \
-	 "=m" (*(1+(long *) (gate_addr))), "=&a" (__d0), "=&d" (__d1) \
-	:"i" ((short) (0x8000+(dpl<<13)+(type<<8))), \
-	 "3" ((char *) (addr)),"2" (__KERNEL_CS << 16)); \
+    "movw %4,%%dx\n\t" \
+    "movl %%eax,%0\n\t" \
+    "movl %%edx,%1" \
+    :"=m" (*((long *) (gate_addr))), \
+     "=m" (*(1+(long *) (gate_addr))), "=&a" (__d0), "=&d" (__d1) \
+    :"i" ((short) (0x8000+(dpl<<13)+(type<<8))), \
+     "3" ((char *) (addr)),"2" (__KERNEL_CS << 16)); \
 } while (0)
 
 
@@ -805,10 +846,17 @@ do { \
  * Pentium F0 0F bugfix can have resulted in the mapped
  * IDT being write-protected.
  */
+/**
+ * set_intr_gate - 设置IDT【中断门（Interrupt Gate）】，Linux2.4 arch/i386/kernel/traps.c
+ * @n: 向量号，IDT数组下标(0~255)
+ * @addr: 中断入口汇编函数地址（比如interrupt[32]这类外设中断stub）
+ */
 void set_intr_gate(unsigned int n, void *addr)
 {
-	_set_gate(idt_table+n,14,0,addr);
+    // _set_gate(&idt_table[n], 类型码, DPL, 入口地址)
+    _set_gate(idt_table+n,14,0,addr);
 }
+
 
 static void __init set_trap_gate(unsigned int n, void *addr)
 {
@@ -946,48 +994,66 @@ cobalt_init(void)
 	printk("Cobalt APIC enabled: ID reg %lx\n", co_apic_read(CO_APIC_ID));
 }
 #endif
+
+/**
+ * void __init trap_init(void)
+ * Linux2.4 x86 架构，异常向量表(IDT)初始化函数
+ * __init：启动后可释放该函数内存
+ * 作用：填充中断描述符表 IDT，设置 0~19 号CPU异常门，system_call系统调用门，还有iBCS兼容调用门
+ * 调用位置：start_kernel -> trap_init()
+ * 背景：x86保护模式 IDT（Interrupt Descriptor Table），门描述符分为 trap_gate / intr_gate / system_gate / call_gate
+ */
 void __init trap_init(void)
 {
 #ifdef CONFIG_EISA
+	// EISA总线探测，读取EISA标识，判断是否存在EISA总线
 	if (isa_readl(0x0FFFD9) == 'E'+('I'<<8)+('S'<<16)+('A'<<24))
 		EISA_bus = 1;
 #endif
+	//这些异常函数都在  entry.S  中实现，例如：ENTRY(divide_error)
+	// 然后统一进入 error_code代码，接着调用 do_xxxxx(do_divide_error)
+	// do_divide_error 返回之后，回到汇编代码 ret_from_exception
+	// ret_from_exception 判断是否有软中断，并调用handle_softirq 软中断
+	//最后调用 RESTORE_ALL 恢复各种寄存器
+	//通过 iret从中断返回
+	// 1. set_trap_gate：陷阱门。异常发生时，IF标志不自动清零；用于CPU内部异常
+	set_trap_gate(0,&divide_error);         // 0号异常：除零错误
+	set_trap_gate(1,&debug);                // 1号异常：调试异常（断点/单步）
+	set_intr_gate(2,&nmi);                  // 2号：NMI不可屏蔽中断，中断门，进入后自动关中断IF=0
+	set_system_gate(3,&int3);    /* int3-5 can be called from all */ // 3号 int3断点，system_gate：用户态可触发
+	set_system_gate(4,&overflow);           // 4号：溢出异常 INTO指令触发
+	set_system_gate(5,&bounds);             // 5号：BOUNDS边界检查异常
+	set_trap_gate(6,&invalid_op);           // 6号：无效操作码
+	set_trap_gate(7,&device_not_available); // 7号：设备不存在（FPU未初始化）
+	set_trap_gate(8,&double_fault);         // 8号：双重故障，严重异常
+	set_trap_gate(9,&coprocessor_segment_overrun); //9号：协处理器段越界
+	set_trap_gate(10,&invalid_TSS);         //10号：无效TSS任务状态段
+	set_trap_gate(11,&segment_not_present); //11号：段不存在
+	set_trap_gate(12,&stack_segment);       //12号：栈段异常
+	set_trap_gate(13,&general_protection);  //13号：通用保护异常GP，最常见保护错误
+	set_trap_gate(14,&page_fault);          //14号：缺页异常！核心，虚拟内存依赖这个
+	set_trap_gate(15,&spurious_interrupt_bug); //15号：保留/伪中断bug
+	set_trap_gate(16,&coprocessor_error);   //16号：FPU协处理器错误
+	set_trap_gate(17,&alignment_check);     //17号：对齐检查异常
+	set_trap_gate(18,&machine_check);       //18号：机器检查异常，硬件错误
+	set_trap_gate(19,&simd_coprocessor_error); //19号：SIMD浮点异常(SSE)
 
-	set_trap_gate(0,&divide_error);
-	set_trap_gate(1,&debug);
-	set_intr_gate(2,&nmi);
-	set_system_gate(3,&int3);	/* int3-5 can be called from all */
-	set_system_gate(4,&overflow);
-	set_system_gate(5,&bounds);
-	set_trap_gate(6,&invalid_op);
-	set_trap_gate(7,&device_not_available);
-	set_trap_gate(8,&double_fault);
-	set_trap_gate(9,&coprocessor_segment_overrun);
-	set_trap_gate(10,&invalid_TSS);
-	set_trap_gate(11,&segment_not_present);
-	set_trap_gate(12,&stack_segment);
-	set_trap_gate(13,&general_protection);
-	set_trap_gate(14,&page_fault);
-	set_trap_gate(15,&spurious_interrupt_bug);
-	set_trap_gate(16,&coprocessor_error);
-	set_trap_gate(17,&alignment_check);
-	set_trap_gate(18,&machine_check);
-	set_trap_gate(19,&simd_coprocessor_error);
-
+	// 设置系统调用门，SYSCALL_VECTOR就是0x80
 	set_system_gate(SYSCALL_VECTOR,&system_call);
 
 	/*
 	 * default LDT is a single-entry callgate to lcall7 for iBCS
 	 * and a callgate to lcall27 for Solaris/x86 binaries
 	 */
+	// 设置调用门，用于iBCS、Solaris x86二进制程序兼容，旧UNIX二进制仿真exec_domain用到
 	set_call_gate(&default_ldt[0],lcall7);
 	set_call_gate(&default_ldt[4],lcall27);
 
 	/*
 	 * Should be a barrier for any external CPU state.
 	 */
+	// cpu_init：初始化当前CPU的TSS、LDT、段寄存器等CPU硬件上下文
 	cpu_init();
-
 #ifdef CONFIG_X86_VISWS_APIC
 	superio_init();
 	lithium_init();

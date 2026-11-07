@@ -674,17 +674,29 @@ void timer_bh(void)
 	run_timer_list();
 }
 
+/**
+ * do_timer - 系统节拍核心处理函数，定时器中断上半部调用
+ * @regs: 中断发生时的寄存器现场，用来判断中断前是用户态还是内核态
+ *
+ * 功能：jiffies节拍自增；UP平台更新进程计时；标记TIMER_BH、TQUEUE_BH下半部待执行
+ * 约束：硬中断上下文，运行在IRQ0定时器中断中；BH只是打标记，不会立刻执行
+ * 上下文：硬中断上下文
+ */
 void do_timer(struct pt_regs *regs)
 {
-	(*(unsigned long *)&jiffies)++;
+    // jiffies全局节拍计数 +1，HZ=100时每10ms加1
+    (*(unsigned long *)&jiffies)++;
 #ifndef CONFIG_SMP
-	/* SMP process accounting uses the local APIC timer */
-
-	update_process_times(user_mode(regs));
+    /* SMP process accounting uses the local APIC timer */
+    // 非SMP单CPU：根据中断前是否为用户态，更新进程的cpu时间统计（utime/stime）
+    update_process_times(user_mode(regs));
 #endif
-	mark_bh(TIMER_BH);
-	if (TQ_ACTIVE(tq_timer))
-		mark_bh(TQUEUE_BH);
+    // 标记TIMER_BH为待执行，后续BH上下文遍历内核timer_list定时器链表
+    mark_bh(TIMER_BH);
+    // 如果tq_timer任务队列里面有任务待执行
+    if (TQ_ACTIVE(tq_timer))
+        // 标记TQUEUE_BH待执行，下半部执行tq_timer上的任务
+        mark_bh(TQUEUE_BH);
 }
 
 #if !defined(__alpha__) && !defined(__ia64__)
@@ -798,18 +810,36 @@ asmlinkage long sys_getegid(void)
 
 #endif
 
+/**
+ * asmlinkage long sys_nanosleep - nanosleep系统调用实现（Linux2.4）
+ * @rqtp: 用户态传入的请求休眠时间 struct timespec 指针
+ * @rmtp: 用户态指针，休眠被信号打断时，用来保存剩余未休眠的时间；传NULL则不返回剩余时间
+ * 返回值：0=正常时间到休眠完成；-EINTR=被信号唤醒；-EFAULT/-EINVAL 参数错误
+ *
+ * 功能：进程休眠指定时长，可被信号提前打断，并返回剩余休眠时间
+ */
 asmlinkage long sys_nanosleep(struct timespec *rqtp, struct timespec *rmtp)
 {
 	struct timespec t;
 	unsigned long expire;
 
+	// 从用户空间拷贝timespec时间到内核栈变量t
 	if(copy_from_user(&t, rqtp, sizeof(struct timespec)))
 		return -EFAULT;
 
+	// 参数合法性校验：纳秒不能超过1s，不能为负数；秒数不能负数
 	if (t.tv_nsec >= 1000000000L || t.tv_nsec < 0 || t.tv_sec < 0)
 		return -EINVAL;
 
 
+	/*
+	 * 【实时进程短延时特殊优化】
+	 * 如果满足全部条件：
+	 * 1. 休眠时间 <= 2ms
+	 * 2. 当前进程是实时进程（SCHED_FIFO / SCHED_RR，不是SCHED_OTHER）
+	 * 不走定时器+睡眠，直接忙等待 udelay，高精度延时
+	 * 注释说明：SMP环境下，做这个忙等待的时候**不能持有锁**
+	 */
 	if (t.tv_sec == 0 && t.tv_nsec <= 2000000L &&
 	    current->policy != SCHED_OTHER)
 	{
@@ -823,19 +853,26 @@ asmlinkage long sys_nanosleep(struct timespec *rqtp, struct timespec *rmtp)
 		return 0;
 	}
 
+	// 将timespec(秒+纳秒) 换算成jiffies节拍数，+1向上取整
 	expire = timespec_to_jiffies(&t) + (t.tv_sec || t.tv_nsec);
 
+	// 将当前进程设置为可中断睡眠状态 TASK_INTERRUPTIBLE
 	current->state = TASK_INTERRUPTIBLE;
+
+	// schedule_timeout：设置定时器，然后调用schedule()让出CPU
+	// 返回值expire：剩余还需要休眠的jiffies，0代表时间正常到期
 	expire = schedule_timeout(expire);
 
+	// expire !=0：休眠**被信号提前打断**，时间没等够
 	if (expire) {
 		if (rmtp) {
+			// 把剩余jiffies转回timespec，拷贝回用户空间rmtp
 			jiffies_to_timespec(expire, &t);
 			if (copy_to_user(rmtp, &t, sizeof(struct timespec)))
 				return -EFAULT;
 		}
-		return -EINTR;
+		return -EINTR;	// 返回EINTR，表示被信号中断
 	}
-	return 0;
+	return 0; // 休眠时间正常到期，成功返回
 }
 

@@ -26,25 +26,40 @@
 
 #include "util.h"
 
+/**
+ * struct shmid_kernel - System V共享内存内核管理对象，用户态不可见
+ */
 struct shmid_kernel /* private to the kernel */
-{	
-	struct kern_ipc_perm	shm_perm;
-	struct file *		shm_file;
-	int			id;
-	unsigned long		shm_nattch;
-	unsigned long		shm_segsz;
-	time_t			shm_atim;
-	time_t			shm_dtim;
-	time_t			shm_ctim;
-	pid_t			shm_cprid;
-	pid_t			shm_lprid;
+{    
+    // IPC通用权限结构：key、uid/gid、mode、seq序列号
+    struct kern_ipc_perm    shm_perm;
+    // 底层shmem匿名文件，真正承载内存页面
+    struct file *       shm_file;
+    // 对外给用户的shmid（buildid合成：seq + 数组下标）
+    int         id;
+    // 当前attach挂载的进程数量
+    unsigned long       shm_nattch;
+    // 共享内存段字节大小
+    unsigned long       shm_segsz;
+    // 最后一次attach时间
+    time_t          shm_atim;
+    // 最后一次detach时间
+    time_t          shm_dtim;
+    // 创建/最后一次IPC_SET修改时间
+    time_t          shm_ctim;
+    // 创建该shm段的进程pid
+    pid_t           shm_cprid;
+    // 最后一次执行shmat/shmdt的进程pid
+    pid_t           shm_lprid;
 };
+
 
 #define shm_flags	shm_perm.mode
 
 static struct file_operations shm_file_operations;
 static struct vm_operations_struct shm_vm_ops;
 
+//共享内存的管理结构
 static struct ipc_ids shm_ids;
 
 #define shm_lock(id)	((struct shmid_kernel*)ipc_lock(&shm_ids,id))
@@ -86,6 +101,7 @@ static inline struct shmid_kernel *shm_rmid(int id)
 	return (struct shmid_kernel *)ipc_rmid(&shm_ids,id);
 }
 
+//添加一个共享内存
 static inline int shm_addid(struct shmid_kernel *shp)
 {
 	return ipc_addid(&shm_ids, &shp->shm_perm, shm_ctlmni+1);
@@ -170,86 +186,127 @@ static struct vm_operations_struct shm_vm_ops = {
 	nopage:	shmem_nopage,
 };
 
+/**
+ * newseg - 创建一个新的System V共享内存段，sys_shmget创建分支调用
+ * @key: IPC key
+ * @shmflg: 标志与权限位
+ * @size: 用户请求的共享内存大小
+ * return: 成功返回组装好的shmid；失败返回负错误码
+ */
 static int newseg (key_t key, int shmflg, size_t size)
 {
-	int error;
-	struct shmid_kernel *shp;
-	int numpages = (size + PAGE_SIZE -1) >> PAGE_SHIFT;
-	struct file * file;
-	char name[13];
-	int id;
+    int error;
+    struct shmid_kernel *shp;
+    // 向上对齐到page页数
+    int numpages = (size + PAGE_SIZE -1) >> PAGE_SHIFT;
+    struct file * file;
+    char name[13];
+    int id;
 
-	if (size < SHMMIN || size > shm_ctlmax)
-		return -EINVAL;
+    // 校验段大小：大于等于SHMMIN，不超过系统全局上限shm_ctlmax
+    if (size < SHMMIN || size > shm_ctlmax)
+        return -EINVAL;
 
-	if (shm_tot + numpages >= shm_ctlall)
-		return -ENOSPC;
+    // 全局shm总页数超限，返回-ENOSPC
+    if (shm_tot + numpages >= shm_ctlall)
+        return -ENOSPC;
 
-	shp = (struct shmid_kernel *) kmalloc (sizeof (*shp), GFP_USER);
-	if (!shp)
-		return -ENOMEM;
-	sprintf (name, "SYSV%08x", key);
-	file = shmem_file_setup(name, size);
-	error = PTR_ERR(file);
-	if (IS_ERR(file))
-		goto no_file;
+    // 分配shmid_kernel管理结构体
+    shp = (struct shmid_kernel *) kmalloc (sizeof (*shp), GFP_USER);
+    if (!shp)
+        return -ENOMEM;
+    // 给shmem伪文件命名 SYSV+key的十六进制
+    sprintf (name, "SYSV%08x", key);
+    // shmem_file_setup：在tmpfs/shmem层建立一个匿名shmem文件（内核文件）
+    file = shmem_file_setup(name, size);
+    error = PTR_ERR(file);
+    if (IS_ERR(file))
+        goto no_file;
 
-	error = -ENOSPC;
-	id = shm_addid(shp);
-	if(id == -1) 
-		goto no_id;
-	shp->shm_perm.key = key;
-	shp->shm_flags = (shmflg & S_IRWXUGO);
-	shp->shm_cprid = current->pid;
-	shp->shm_lprid = 0;
-	shp->shm_atim = shp->shm_dtim = 0;
-	shp->shm_ctim = CURRENT_TIME;
-	shp->shm_segsz = size;
-	shp->shm_nattch = 0;
-	shp->id = shm_buildid(id,shp->shm_perm.seq);
-	shp->shm_file = file;
-	file->f_dentry->d_inode->i_ino = shp->id;
-	file->f_op = &shm_file_operations;
-	shm_tot += numpages;
-	shm_unlock (id);
-	return shp->id;
+    error = -ENOSPC;
+    // 分配shm数组下标id，初始化shp->shm_perm（seq序列号在这里生成）
+    id = shm_addid(shp);
+    if(id == -1) 
+        goto no_id;
+    // 填充IPC权限、属性
+    shp->shm_perm.key = key;
+    shp->shm_flags = (shmflg & S_IRWXUGO);
+    shp->shm_cprid = current->pid;    // 创建者pid
+    shp->shm_lprid = 0;
+    shp->shm_atim = shp->shm_dtim = 0;
+    shp->shm_ctim = CURRENT_TIME;     // 创建时间
+    shp->shm_segsz = size;            // 段大小
+    shp->shm_nattch = 0;              // 当前挂载计数，初始0
+    // 对外暴露的shmid = seq * SEQ_MULTIPLIER + id
+    shp->id = shm_buildid(id,shp->shm_perm.seq);
+    // 绑定shmem文件
+    shp->shm_file = file;
+    // inode编号设置为shmid
+    file->f_dentry->d_inode->i_ino = shp->id;
+    // 替换文件操作集为shm专属ops
+    file->f_op = &shm_file_operations;
+    // 全局shm页数统计累加
+    shm_tot += numpages;
+    // 释放shm对象自旋锁（shm_addid内部会上锁）
+    shm_unlock (id);
+    return shp->id;
 
 no_id:
-	fput(file);
+    // shm_addid失败，释放file引用
+    fput(file);
 no_file:
-	kfree(shp);
-	return error;
+    // 释放shmid_kernel结构体
+    kfree(shp);
+    return error;
 }
 
+/**
+ * sys_shmget - System V共享内存段创建/查找系统调用
+ * @key: IPC键值，IPC_PRIVATE代表私有段
+ * @size: 共享内存段大小
+ * @shmflg: 标志位 IPC_CREAT / IPC_EXCL / 权限位
+ * return: 成功返回shmid；失败返回负错误码
+ */
 asmlinkage long sys_shmget (key_t key, size_t size, int shmflg)
 {
-	struct shmid_kernel *shp;
-	int err, id = 0;
+    struct shmid_kernel *shp;
+    int err, id = 0;
 
-	down(&shm_ids.sem);
-	if (key == IPC_PRIVATE) {
-		err = newseg(key, shmflg, size);
-	} else if ((id = ipc_findkey(&shm_ids, key)) == -1) {
-		if (!(shmflg & IPC_CREAT))
-			err = -ENOENT;
-		else
-			err = newseg(key, shmflg, size);
-	} else if ((shmflg & IPC_CREAT) && (shmflg & IPC_EXCL)) {
-		err = -EEXIST;
-	} else {
-		shp = shm_lock(id);
-		if(shp==NULL)
-			BUG();
-		if (shp->shm_segsz < size)
-			err = -EINVAL;
-		else if (ipcperms(&shp->shm_perm, shmflg))
-			err = -EACCES;
-		else
-			err = shm_buildid(id, shp->shm_perm.seq);
-		shm_unlock(id);
-	}
-	up(&shm_ids.sem);
-	return err;
+    // 拿shm全局粗粒度信号量，保护整个查找+创建流程
+    down(&shm_ids.sem);
+    if (key == IPC_PRIVATE) {
+        // IPC_PRIVATE：总是新建共享内存段，不按key查找
+        err = newseg(key, shmflg, size);
+    } else if ((id = ipc_findkey(&shm_ids, key)) == -1) {
+        // 根据key查找，没有找到对应shm段
+        if (!(shmflg & IPC_CREAT))
+            // 没有指定创建，直接返回不存在
+            err = -ENOENT;
+        else
+            // 指定创建，调用newseg分配新段
+            err = newseg(key, shmflg, size);
+    } else if ((shmflg & IPC_CREAT) && (shmflg & IPC_EXCL)) {
+        // IPC_CREAT | IPC_EXCL：要求新建，但key已经存在，返回已存在
+        err = -EEXIST;
+    } else {
+        // key找到已有shm段，直接复用
+        shp = shm_lock(id);
+        if(shp==NULL)
+            BUG();
+        // 检查：已有段的空间不能小于用户请求size
+        if (shp->shm_segsz < size)
+            err = -EINVAL;
+        else if (ipcperms(&shp->shm_perm, shmflg))
+            // 权限校验失败
+            err = -EACCES;
+        else
+            // 组装对外的shmid（类似ipc_buildid，下标+序列号）
+            err = shm_buildid(id, shp->shm_perm.seq);
+        shm_unlock(id);
+    }
+    // 释放全局shm信号量
+    up(&shm_ids.sem);
+    return err;
 }
 
 static inline unsigned long copy_shmid_to_user(void *buf, struct shmid64_ds *in, int version)
@@ -365,265 +422,314 @@ static void shm_get_stat (unsigned long *rss, unsigned long *swp)
 	}
 }
 
+/**
+ * sys_shmctl - System V共享内存控制系统调用
+ * @shmid: 共享内存段id
+ * @cmd: 控制命令 IPC_STAT / IPC_SET / IPC_RMID / SHM_LOCK / SHM_UNLOCK / IPC_INFO / SHM_INFO / SHM_STAT
+ * @buf: 用户态shmid_ds缓冲区，用于传入或者读出信息
+ * return: 成功返回非负值；失败返回负错误码
+ */
 asmlinkage long sys_shmctl (int shmid, int cmd, struct shmid_ds *buf)
 {
-	struct shm_setbuf setbuf;
-	struct shmid_kernel *shp;
-	int err, version;
+    struct shm_setbuf setbuf;
+    struct shmid_kernel *shp;
+    int err, version;
 
-	if (cmd < 0 || shmid < 0)
-		return -EINVAL;
+    if (cmd < 0 || shmid < 0)
+        return -EINVAL;
 
-	version = ipc_parse_version(&cmd);
+    // 区分老版本/新版本ipc结构体版本，适配32/64兼容
+    version = ipc_parse_version(&cmd);
 
-	switch (cmd) { /* replace with proc interface ? */
-	case IPC_INFO:
-	{
-		struct shminfo64 shminfo;
+    switch (cmd) { /* replace with proc interface ? */
+    case IPC_INFO:
+    {
+        struct shminfo64 shminfo;
 
-		memset(&shminfo,0,sizeof(shminfo));
-		shminfo.shmmni = shminfo.shmseg = shm_ctlmni;
-		shminfo.shmmax = shm_ctlmax;
-		shminfo.shmall = shm_ctlall;
+        memset(&shminfo,0,sizeof(shminfo));
+        // 填充系统全局shm上限参数
+        shminfo.shmmni = shminfo.shmseg = shm_ctlmni;
+        shminfo.shmmax = shm_ctlmax;
+        shminfo.shmall = shm_ctlall;
 
-		shminfo.shmmin = SHMMIN;
-		if(copy_shminfo_to_user (buf, &shminfo, version))
-			return -EFAULT;
-		/* reading a integer is always atomic */
-		err= shm_ids.max_id;
-		if(err<0)
-			err = 0;
-		return err;
-	}
-	case SHM_INFO:
-	{
-		struct shm_info shm_info;
+        shminfo.shmmin = SHMMIN;
+        // 拷贝全局shm配置信息给用户
+        if(copy_shminfo_to_user (buf, &shminfo, version))
+            return -EFAULT;
+        /* reading a integer is always atomic */
+        err= shm_ids.max_id;
+        if(err<0)
+            err = 0;
+        return err;
+    }
+    case SHM_INFO:
+    {
+        struct shm_info shm_info;
 
-		memset(&shm_info,0,sizeof(shm_info));
-		down(&shm_ids.sem);
-		shm_lockall();
-		shm_info.used_ids = shm_ids.in_use;
-		shm_get_stat (&shm_info.shm_rss, &shm_info.shm_swp);
-		shm_info.shm_tot = shm_tot;
-		shm_info.swap_attempts = 0;
-		shm_info.swap_successes = 0;
-		err = shm_ids.max_id;
-		shm_unlockall();
-		up(&shm_ids.sem);
-		if(copy_to_user (buf, &shm_info, sizeof(shm_info)))
-			return -EFAULT;
+        memset(&shm_info,0,sizeof(shm_info));
+        down(&shm_ids.sem);
+        shm_lockall();
+        shm_info.used_ids = shm_ids.in_use;
+        // 获取shm占用rss、swap统计
+        shm_get_stat (&shm_info.shm_rss, &shm_info.shm_swp);
+        shm_info.shm_tot = shm_tot;
+        shm_info.swap_attempts = 0;
+        shm_info.swap_successes = 0;
+        err = shm_ids.max_id;
+        shm_unlockall();
+        up(&shm_ids.sem);
+        if(copy_to_user (buf, &shm_info, sizeof(shm_info)))
+            return -EFAULT;
 
-		return err < 0 ? 0 : err;
-	}
-	case SHM_STAT:
-	case IPC_STAT:
-	{
-		struct shmid64_ds tbuf;
-		int result;
-		memset(&tbuf, 0, sizeof(tbuf));
-		shp = shm_lock(shmid);
-		if(shp==NULL)
-			return -EINVAL;
-		if(cmd==SHM_STAT) {
-			err = -EINVAL;
-			if (shmid > shm_ids.max_id)
-				goto out_unlock;
-			result = shm_buildid(shmid, shp->shm_perm.seq);
-		} else {
-			err = shm_checkid(shp,shmid);
-			if(err)
-				goto out_unlock;
-			result = 0;
-		}
-		err=-EACCES;
-		if (ipcperms (&shp->shm_perm, S_IRUGO))
-			goto out_unlock;
-		kernel_to_ipc64_perm(&shp->shm_perm, &tbuf.shm_perm);
-		tbuf.shm_segsz	= shp->shm_segsz;
-		tbuf.shm_atime	= shp->shm_atim;
-		tbuf.shm_dtime	= shp->shm_dtim;
-		tbuf.shm_ctime	= shp->shm_ctim;
-		tbuf.shm_cpid	= shp->shm_cprid;
-		tbuf.shm_lpid	= shp->shm_lprid;
-		tbuf.shm_nattch	= shp->shm_nattch;
-		shm_unlock(shmid);
-		if(copy_shmid_to_user (buf, &tbuf, version))
-			return -EFAULT;
-		return result;
-	}
-	case SHM_LOCK:
-	case SHM_UNLOCK:
-	{
+        return err < 0 ? 0 : err;
+    }
+    case SHM_STAT:
+    case IPC_STAT:
+    {
+        struct shmid64_ds tbuf;
+        int result;
+        memset(&tbuf, 0, sizeof(tbuf));
+        // 根据shmid拿到内核shmid_kernel对象，持有ary自旋锁
+        shp = shm_lock(shmid);
+        if(shp==NULL)
+            return -EINVAL;
+        if(cmd==SHM_STAT) {
+            err = -EINVAL;
+            if (shmid > shm_ids.max_id)
+                goto out_unlock;
+            // SHM_STAT：按数组下标查询，返回合成shmid
+            result = shm_buildid(shmid, shp->shm_perm.seq);
+        } else {
+            err = shm_checkid(shp,shmid);
+            if(err)
+                goto out_unlock;
+            result = 0;
+        }
+        err=-EACCES;
+        // 读权限校验
+        if (ipcperms (&shp->shm_perm, S_IRUGO))
+            goto out_unlock;
+        // 内核shmid_kernel字段拷贝到临时导出结构体
+        kernel_to_ipc64_perm(&shp->shm_perm, &tbuf.shm_perm);
+        tbuf.shm_segsz  = shp->shm_segsz;
+        tbuf.shm_atime  = shp->shm_atim;
+        tbuf.shm_dtime  = shp->shm_dtim;
+        tbuf.shm_ctime  = shp->shm_ctim;
+        tbuf.shm_cpid   = shp->shm_cprid;
+        tbuf.shm_lpid   = shp->shm_lprid;
+        tbuf.shm_nattch = shp->shm_nattch;
+        shm_unlock(shmid);
+        // 拷贝到用户态shmid_ds
+        if(copy_shmid_to_user (buf, &tbuf, version))
+            return -EFAULT;
+        return result;
+    }
+    case SHM_LOCK:
+    case SHM_UNLOCK:
+    {
 /* Allow superuser to lock segment in memory */
 /* Should the pages be faulted in here or leave it to user? */
 /* need to determine interaction with current->swappable */
-		if (!capable(CAP_IPC_LOCK))
-			return -EPERM;
+        // 需要CAP_IPC_LOCK权限
+        if (!capable(CAP_IPC_LOCK))
+            return -EPERM;
 
-		shp = shm_lock(shmid);
-		if(shp==NULL)
-			return -EINVAL;
-		err = shm_checkid(shp,shmid);
-		if(err)
-			goto out_unlock;
-		if(cmd==SHM_LOCK) {
-			shp->shm_file->f_dentry->d_inode->u.shmem_i.locked = 1;
-			shp->shm_flags |= SHM_LOCKED;
-		} else {
-			shp->shm_file->f_dentry->d_inode->u.shmem_i.locked = 0;
-			shp->shm_flags &= ~SHM_LOCKED;
-		}
-		shm_unlock(shmid);
-		return err;
-	}
-	case IPC_RMID:
-	{
-		/*
-		 *	We cannot simply remove the file. The SVID states
-		 *	that the block remains until the last person
-		 *	detaches from it, then is deleted. A shmat() on
-		 *	an RMID segment is legal in older Linux and if 
-		 *	we change it apps break...
-		 *
-		 *	Instead we set a destroyed flag, and then blow
-		 *	the name away when the usage hits zero.
-		 */
-		down(&shm_ids.sem);
-		shp = shm_lock(shmid);
-		err = -EINVAL;
-		if (shp == NULL) 
-			goto out_up;
-		err = shm_checkid(shp, shmid);
-		if (err == 0) {
-			if (shp->shm_nattch){
-				shp->shm_flags |= SHM_DEST;
-				/* Do not find it any more */
-				shp->shm_perm.key = IPC_PRIVATE;
-			} else
-				shm_destroy (shp);
-		}
-		/* Unlock */
-		shm_unlock(shmid);
-		up(&shm_ids.sem);
-		return err;
-	}
+        shp = shm_lock(shmid);
+        if(shp==NULL)
+            return -EINVAL;
+        err = shm_checkid(shp,shmid);
+        if(err)
+            goto out_unlock;
+        if(cmd==SHM_LOCK) {
+            // 标记shmem inode锁定：页面不允许被swap换出
+            shp->shm_file->f_dentry->d_inode->u.shmem_i.locked = 1;
+            shp->shm_flags |= SHM_LOCKED;
+        } else {
+            // 解除锁定，页面可以被swap
+            shp->shm_file->f_dentry->d_inode->u.shmem_i.locked = 0;
+            shp->shm_flags &= ~SHM_LOCKED;
+        }
+        shm_unlock(shmid);
+        return err;
+    }
+    case IPC_RMID:
+    {
+        /*
+         *  We cannot simply remove the file. The SVID states
+         *  that the block remains until the last person
+         *  detaches from it, then is deleted. A shmat() on
+         *  an RMID segment is legal in older Linux and if 
+         *  we change it apps break...
+         *
+         *  Instead we set a destroyed flag, and then blow
+         *  the name away when the usage hits zero.
+         */
+        down(&shm_ids.sem);
+        shp = shm_lock(shmid);
+        err = -EINVAL;
+        if (shp == NULL) 
+            goto out_up;
+        err = shm_checkid(shp, shmid);
+        if (err == 0) {
+            if (shp->shm_nattch){
+                // 还有进程attach挂载：只打SHM_DEST标记，key置为IPC_PRIVATE，不再能通过key查到
+                shp->shm_flags |= SHM_DEST;
+                /* Do not find it any more */
+                shp->shm_perm.key = IPC_PRIVATE;
+            } else
+                // 没有任何进程attach，直接销毁shm段
+                shm_destroy (shp);
+        }
+        /* Unlock */
+        shm_unlock(shmid);
+        up(&shm_ids.sem);
+        return err;
+    }
 
-	case IPC_SET:
-	{
-		if(copy_shmid_from_user (&setbuf, buf, version))
-			return -EFAULT;
-		down(&shm_ids.sem);
-		shp = shm_lock(shmid);
-		err=-EINVAL;
-		if(shp==NULL)
-			goto out_up;
-		err = shm_checkid(shp,shmid);
-		if(err)
-			goto out_unlock_up;
-		err=-EPERM;
-		if (current->euid != shp->shm_perm.uid &&
-		    current->euid != shp->shm_perm.cuid && 
-		    !capable(CAP_SYS_ADMIN)) {
-			goto out_unlock_up;
-		}
+    case IPC_SET:
+    {
+        // 从用户buf读取uid/gid/mode
+        if(copy_shmid_from_user (&setbuf, buf, version))
+            return -EFAULT;
+        down(&shm_ids.sem);
+        shp = shm_lock(shmid);
+        err=-EINVAL;
+        if(shp==NULL)
+            goto out_up;
+        err = shm_checkid(shp,shmid);
+        if(err)
+            goto out_unlock_up;
+        err=-EPERM;
+        // 权限校验：创建者/所有者/管理员才能修改
+        if (current->euid != shp->shm_perm.uid &&
+            current->euid != shp->shm_perm.cuid && 
+            !capable(CAP_SYS_ADMIN)) {
+            goto out_unlock_up;
+        }
 
-		shp->shm_perm.uid = setbuf.uid;
-		shp->shm_perm.gid = setbuf.gid;
-		shp->shm_flags = (shp->shm_flags & ~S_IRWXUGO)
-			| (setbuf.mode & S_IRWXUGO);
-		shp->shm_ctim = CURRENT_TIME;
-		break;
-	}
+        // 更新所有者、组、权限，刷新修改时间shm_ctim
+        shp->shm_perm.uid = setbuf.uid;
+        shp->shm_perm.gid = setbuf.gid;
+        shp->shm_flags = (shp->shm_flags & ~S_IRWXUGO)
+            | (setbuf.mode & S_IRWXUGO);
+        shp->shm_ctim = CURRENT_TIME;
+        break;
+    }
 
-	default:
-		return -EINVAL;
-	}
+    default:
+        return -EINVAL;
+    }
 
-	err = 0;
+    err = 0;
 out_unlock_up:
-	shm_unlock(shmid);
+    shm_unlock(shmid);
 out_up:
-	up(&shm_ids.sem);
-	return err;
+    up(&shm_ids.sem);
+    return err;
 out_unlock:
-	shm_unlock(shmid);
-	return err;
+    shm_unlock(shmid);
+    return err;
 }
+
 
 /*
  * Fix shmaddr, allocate descriptor, map shm, add attach descriptor to lists.
  */
+/**
+ * sys_shmat - System V共享内存attach，把shm段映射到进程虚拟地址空间
+ * @shmid: 共享内存id
+ * @shmaddr: 用户指定映射起始虚拟地址，0由内核自动分配
+ * @shmflg: 标志 SHM_RDONLY / SHM_RND
+ * @raddr: 输出参数，内核把成功映射后的虚拟地址写回用户态
+ * return: 成功0，失败负错误码
+ */
 asmlinkage long sys_shmat (int shmid, char *shmaddr, int shmflg, ulong *raddr)
 {
-	struct shmid_kernel *shp;
-	unsigned long addr;
-	struct file * file;
-	int    err;
-	unsigned long flags;
-	unsigned long prot;
-	unsigned long o_flags;
-	int acc_mode;
-	void *user_addr;
+    struct shmid_kernel *shp;
+    unsigned long addr;
+    struct file * file;
+    int    err;
+    unsigned long flags;
+    unsigned long prot;
+    unsigned long o_flags;
+    int acc_mode;
+    void *user_addr;
 
-	if (shmid < 0)
-		return -EINVAL;
+    if (shmid < 0)
+        return -EINVAL;
 
-	if ((addr = (ulong)shmaddr)) {
-		if (addr & (SHMLBA-1)) {
-			if (shmflg & SHM_RND)
-				addr &= ~(SHMLBA-1);	   /* round down */
-			else
-				return -EINVAL;
-		}
-		flags = MAP_SHARED | MAP_FIXED;
-	} else
-		flags = MAP_SHARED;
+    // 分支：用户传入shmaddr != 0，指定映射地址
+    if ((addr = (ulong)shmaddr)) {
+        // 检查是否满足SHMLBA对齐（共享内存对齐粒度）
+        if (addr & (SHMLBA-1)) {
+            if (shmflg & SHM_RND)
+                addr &= ~(SHMLBA-1);     /* round down 向下对齐 */
+            else
+                // 未指定SHM_RND但地址不对齐，直接报错
+                return -EINVAL;
+        }
+        // 用户指定地址：MAP_FIXED，强制映射到该地址
+        flags = MAP_SHARED | MAP_FIXED;
+    } else
+        // shmaddr=0：内核自动选空闲虚拟地址，不带MAP_FIXED
+        flags = MAP_SHARED;
 
-	if (shmflg & SHM_RDONLY) {
-		prot = PROT_READ;
-		o_flags = O_RDONLY;
-		acc_mode = S_IRUGO;
-	} else {
-		prot = PROT_READ | PROT_WRITE;
-		o_flags = O_RDWR;
-		acc_mode = S_IRUGO | S_IWUGO;
-	}
+    if (shmflg & SHM_RDONLY) {
+        // 只读attach
+        prot = PROT_READ;
+        o_flags = O_RDONLY;
+        acc_mode = S_IRUGO;
+    } else {
+        // 读写attach
+        prot = PROT_READ | PROT_WRITE;
+        o_flags = O_RDWR;
+        acc_mode = S_IRUGO | S_IWUGO;
+    }
 
-	/*
-	 * We cannot rely on the fs check since SYSV IPC does have an
-	 * aditional creator id...
-	 */
-	shp = shm_lock(shmid);
-	if(shp == NULL)
-		return -EINVAL;
-	if (ipcperms(&shp->shm_perm, acc_mode)) {
-		shm_unlock(shmid);
-		return -EACCES;
-	}
-	file = shp->shm_file;
-	shp->shm_nattch++;
-	shm_unlock(shmid);
+    /*
+     * We cannot rely on the fs check since SYSV IPC does have an
+     * aditional creator id...
+     */
+    // 拿到shm内核对象，自旋锁保护
+    shp = shm_lock(shmid);
+    if(shp == NULL)
+        return -EINVAL;
+    // IPC权限检查，不走普通文件权限，走kern_ipc_perm
+    if (ipcperms(&shp->shm_perm, acc_mode)) {
+        shm_unlock(shmid);
+        return -EACCES;
+    }
+    // 取出底层shmem匿名file（前面shmem_file_setup创建的）
+    file = shp->shm_file;
+    // attach计数先+1
+    shp->shm_nattch++;
+    shm_unlock(shmid);
 
-	down(&current->mm->mmap_sem);
-	user_addr = (void *) do_mmap (file, addr, file->f_dentry->d_inode->i_size, prot, flags, 0);
-	up(&current->mm->mmap_sem);
+    // mmap信号量，保护进程vma树
+    down(&current->mm->mmap_sem);
+    // 核心：do_mmap，对shmem文件建立共享映射
+    user_addr = (void *) do_mmap (file, addr, file->f_dentry->d_inode->i_size, prot, flags, 0);
+    up(&current->mm->mmap_sem);
 
-	down (&shm_ids.sem);
-	if(!(shp = shm_lock(shmid)))
-		BUG();
-	shp->shm_nattch--;
-	if(shp->shm_nattch == 0 &&
-	   shp->shm_flags & SHM_DEST)
-		shm_destroy (shp);
-	shm_unlock(shmid);
-	up (&shm_ids.sem);
+    // 再拿全局shm_ids.sem，重新检查shm对象状态
+    down (&shm_ids.sem);
+    if(!(shp = shm_lock(shmid)))
+        BUG();
+    // 注意：不管do_mmap成功失败，都要把刚才+1的nattch减掉！
+    shp->shm_nattch--;
+    // 关键判断：如果当前nattch减到0，并且已经标记SHM_DEST（IPC_RMID打过删除标记）
+    if(shp->shm_nattch == 0 &&
+       shp->shm_flags & SHM_DEST)
+        shm_destroy (shp);
+    shm_unlock(shmid);
+    up (&shm_ids.sem);
 
-	*raddr = (unsigned long) user_addr;
-	err = 0;
-	if (IS_ERR(user_addr))
-		err = PTR_ERR(user_addr);
-	return err;
-
+    // 把映射后的虚拟地址返回给用户
+    *raddr = (unsigned long) user_addr;
+    err = 0;
+    if (IS_ERR(user_addr))
+        err = PTR_ERR(user_addr);
+    return err;
 }
 
 /*

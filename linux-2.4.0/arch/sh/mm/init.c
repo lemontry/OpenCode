@@ -179,7 +179,20 @@ void show_mem(void)
 extern char _text, _etext, _edata, __bss_start, _end;
 extern char __init_begin, __init_end;
 
+/**
+ * pgd_t swapper_pg_dir[1024];
+ * 全局内核页目录（Page Global Directory），也就是内核主页目录; 
+ * 它是**内核启动阶段的初始页目录**，也就是「swapper 进程（0 号进程，idle 进程）」的页目录。
+ * 适用：Linux 2.4 x86 32位，两级页表（PAE关闭时）
+ * 定义位置：arch/i386/kernel/head.c
+ *
+ * 背景：
+ * x86 32位、非PAE：页表是两级：PGD(页目录) → PTE(页表)
+ * 每个PGD表项pgd_t，指向一个PTE页表
+ * 数组大小1024项，刚好覆盖整个4G虚拟地址空间的页目录索引
+ */
 pgd_t swapper_pg_dir[1024];
+
 
 /* It'd be good if these lines were in the standard header file. */
 #define START_PFN	(NODE_DATA(0)->bdata->node_boot_start >> PAGE_SHIFT)

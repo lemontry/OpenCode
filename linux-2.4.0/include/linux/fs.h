@@ -397,6 +397,11 @@ struct block_device {
 	struct semaphore	bd_sem;	/* open/close mutex */
 };
 
+/**
+ * struct inode - Linux 2.4 内核 VFS inode 结构体
+ * 一个inode代表文件系统里一个独立的文件对象（普通文件/目录/管道/设备/套接字等）
+ * 不同文件系统私有信息放在末尾union u里面；特殊类型有单独指针（i_pipe/i_bdev等）
+ */
 struct inode {
 	struct list_head	i_hash;
 	struct list_head	i_list;
@@ -419,6 +424,8 @@ struct inode {
 	unsigned long		i_blksize;
 	unsigned long		i_blocks;
 	unsigned long		i_version;
+
+	//inode的同步信号
 	struct semaphore	i_sem;
 	struct semaphore	i_zombie;
 	struct inode_operations	*i_op;
@@ -429,6 +436,8 @@ struct inode {
 	struct address_space	*i_mapping;
 	struct address_space	i_data;	
 	struct dquot		*i_dquot[MAXQUOTAS];
+
+	// 管道inode专用，管道控制块指针，pipefs使用
 	struct pipe_inode_info	*i_pipe;
 	struct block_device	*i_bdev;
 
@@ -1165,9 +1174,21 @@ static inline long PTR_ERR(const void *ptr)
 	return (long) ptr;
 }
 
+/**
+ * IS_ERR - 判断指针是不是内核错误指针（把错误码编码进指针）
+ * @ptr: 待检查的指针
+ *
+ * 返回：非0表示是错误指针；0代表是正常有效指针
+ *
+ * 原理：内核把负数错误码（-ENOENT、-ENOMEM等）强转成void*返回
+ *       合法用户/内核空间的有效地址，不会落在 [-1000, -1] 这个区间
+ *       也就是：(unsigned long)-1000L ~ ULONG_MAX
+ */
 static inline long IS_ERR(const void *ptr)
 {
-	return (unsigned long)ptr > (unsigned long)-1000L;
+    // (unsigned long)-1000L 等价于 ULONG_MAX - 999
+    // 如果ptr的值落在最后1000个地址以内 → 认为是错误码编码的指针
+    return (unsigned long)ptr > (unsigned long)-1000L;
 }
 
 /*

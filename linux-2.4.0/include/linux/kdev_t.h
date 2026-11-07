@@ -84,21 +84,35 @@ static inline unsigned int kdev_t_to_nr(kdev_t dev) {
 	return (MAJOR(dev)<<8) | MINOR(dev);
 }
 
+/**
+ * to_kdev_t - 将用户传入的dev_t（用户态设备号）转换成内核kdev_t格式
+ * @dev: 用户态传进来的设备号
+ *
+ * 2.4内核i386：主设备号8bit，次设备号8bit，合计16bit
+ * 高8位=major主设备号，低8位=minor次设备号
+ */
 static inline kdev_t to_kdev_t(int dev)
 {
-	int major, minor;
+    int major, minor;
 #if 0
-	major = (dev >> 16);
-	if (!major) {
-		major = (dev >> 8);
-		minor = (dev & 0xff);
-	} else
-		minor = (dev & 0xffff);
+    /*
+     * 旧版本兼容分支（被注释禁用）：支持16位主设备号扩展格式
+     * 逻辑：如果高16位不为0，则major=高16bit，minor=低16bit
+     * 早期内核曾经尝试过大设备号方案，后面废弃
+     */
+    major = (dev >> 16);
+    if (!major) {
+        major = (dev >> 8);
+        minor = (dev & 0xff);
+    } else
+        minor = (dev & 0xffff);
 #else
-	major = (dev >> 8);
-	minor = (dev & 0xff);
+    // 当前启用逻辑：标准8+8设备号拆分
+    major = (dev >> 8);       // 取出高8bit：主设备号
+    minor = (dev & 0xff);     // 取出低8bit：次设备号
 #endif
-	return MKDEV(major, minor);
+    // MKDEV：拼接major、minor，组装成内核标准kdev_t
+    return MKDEV(major, minor);
 }
 
 #else /* __KERNEL__ */

@@ -351,6 +351,7 @@ static int sock_map_fd(struct socket *sock)
 		this.len = strlen(name);
 		this.hash = sock->inode->i_ino;
 
+		// 为文件分配一个目录项
 		file->f_dentry = d_alloc(sock_mnt->mnt_sb->s_root, &this);
 		if (!file->f_dentry) {
 			put_filp(file);
@@ -358,10 +359,13 @@ static int sock_map_fd(struct socket *sock)
 			fd = -ENOMEM;
 			goto out;
 		}
+
+		//目录项的操作
 		file->f_dentry->d_op = &sockfs_dentry_operations;
 		d_add(file->f_dentry, sock->inode);
 		file->f_vfsmnt = mntget(sock_mnt);
 
+		//文件的操作
 		sock->file = file;
 		file->f_op = sock->inode->i_fop = &socket_file_ops;
 		file->f_mode = 3;
@@ -391,32 +395,45 @@ extern __inline__ struct socket *socki_lookup(struct inode *inode)
  *
  *	On a success the socket object pointer is returned.
  */
-
+/**
+ * sockfd_lookup - 根据文件描述符fd查找对应的socket对象
+ * @fd: 待查找的文件描述符
+ * @err: 输出参数，存放失败时的错误码
+ *
+ * 返回值：成功返回struct socket指针；失败返回NULL，并填充*err
+ * 说明：先通过fd拿到file，再由file拿到inode，校验inode是否为socket类型，最后通过inode取出socket；
+ * fget会增加file引用计数，调用方需要配对使用sockfd_put释放
+ */
 struct socket *sockfd_lookup(int fd, int *err)
 {
-	struct file *file;
-	struct inode *inode;
-	struct socket *sock;
+    struct file *file;
+    struct inode *inode;
+    struct socket *sock;
 
-	if (!(file = fget(fd)))
-	{
-		*err = -EBADF;
-		return NULL;
-	}
+    // 根据fd获取file结构体，fget增加file引用计数
+    if (!(file = fget(fd)))
+    {
+        *err = -EBADF;
+        return NULL;
+    }
 
-	inode = file->f_dentry->d_inode;
-	if (!inode->i_sock || !(sock = socki_lookup(inode)))
-	{
-		*err = -ENOTSOCK;
-		fput(file);
-		return NULL;
-	}
+    // 从file的dentry拿到对应的inode
+    inode = file->f_dentry->d_inode;
+    // 判断inode是否是socket类型（i_sock标记），并通过inode取出socket
+    if (!inode->i_sock || !(sock = socki_lookup(inode)))
+    {
+        *err = -ENOTSOCK;
+        // 不是socket文件，释放file引用
+        fput(file);
+        return NULL;
+    }
 
-	if (sock->file != file) {
-		printk(KERN_ERR "socki_lookup: socket file changed!\n");
-		sock->file = file;
-	}
-	return sock;
+    // 容错：sock内记录的file和当前file不一致时修复
+    if (sock->file != file) {
+        printk(KERN_ERR "socki_lookup: socket file changed!\n");
+        sock->file = file;
+    }
+    return sock;
 }
 
 extern __inline__ void sockfd_put(struct socket *sock)
@@ -432,34 +449,56 @@ extern __inline__ void sockfd_put(struct socket *sock)
  *	NULL is returned.
  */
 
+/**
+ * sock_alloc - 分配一个socket内核对象，配套创建匿名inode
+ *
+ * 返回值：成功返回struct socket*；inode分配失败返回NULL
+ * 说明：socket依托匿名inode实现VFS文件模型；inode和socket一一绑定，
+ * socki_lookup是通过inode拿到socket的反向关联。
+ */
 struct socket *sock_alloc(void)
 {
-	struct inode * inode;
-	struct socket * sock;
+    struct inode * inode;
+    struct socket * sock;
 
-	inode = get_empty_inode();
-	if (!inode)
-		return NULL;
+    // 获取一个空白匿名inode（socket、pipe这类匿名文件用）
+    inode = get_empty_inode();
+    if (!inode)
+        return NULL;
 
-	inode->i_sb = sock_mnt->mnt_sb;
-	sock = socki_lookup(inode);
+    // 将inode绑定socket文件系统的超级块sock_mnt->mnt_sb
+    inode->i_sb = sock_mnt->mnt_sb;
+    // 从inode取出socket指针（inode和socket是成对分配、内嵌关联）
+    sock = socki_lookup(inode);
 
-	inode->i_mode = S_IFSOCK|S_IRWXUGO;
-	inode->i_sock = 1;
-	inode->i_uid = current->fsuid;
-	inode->i_gid = current->fsgid;
+    // inode文件类型标记为套接字，权限设为0777
+    inode->i_mode = S_IFSOCK|S_IRWXUGO;
+    // 标记该inode是socket类型inode
+    inode->i_sock = 1;
+    // 继承当前进程的fsuid、fsgid
+    inode->i_uid = current->fsuid;
+    inode->i_gid = current->fsgid;
 
-	sock->inode = inode;
-	init_waitqueue_head(&sock->wait);
-	sock->fasync_list = NULL;
-	sock->state = SS_UNCONNECTED;
-	sock->flags = 0;
-	sock->ops = NULL;
-	sock->sk = NULL;
-	sock->file = NULL;
+    // socket反向绑定inode
+    sock->inode = inode;
+    // 初始化socket等待队列，用于阻塞读写等待
+    init_waitqueue_head(&sock->wait);
+    // 异步通知链表初始为空
+    sock->fasync_list = NULL;
+    // 初始状态：未连接
+    sock->state = SS_UNCONNECTED;
+    // socket标志清零
+    sock->flags = 0;
+    // 协议操作集ops，后续由inet_create等赋值
+    sock->ops = NULL;
+    // 底层sock(sk)，协议层后续分配
+    sock->sk = NULL;
+    // 关联file结构体，sock_map_fd之后才会赋值
+    sock->file = NULL;
 
-	sockets_in_use[smp_processor_id()].counter++;
-	return sock;
+    // 按CPU统计正在使用的socket计数
+    sockets_in_use[smp_processor_id()].counter++;
+    return sock;
 }
 
 /*
@@ -811,101 +850,135 @@ int sock_wake_async(struct socket *sock, int how, int band)
 }
 
 
+/**
+ * sock_create - 创建socket内核对象，协议族分发入口
+ * @family: 协议族 PF_INET / PF_UNIX / PF_PACKET
+ * @type: 套接字类型 SOCK_STREAM / SOCK_DGRAM
+ * @protocol: 子协议号，0 由协议族选默认协议
+ * @res: 输出参数，成功时存放新建 struct socket*
+ *
+ * 返回值：成功返回0；失败返回负错误码
+ */
 int sock_create(int family, int type, int protocol, struct socket **res)
 {
-	int i;
-	struct socket *sock;
+    int i;
+    struct socket *sock;
 
-	/*
-	 *	Check protocol is in range
-	 */
-	if(family<0 || family>=NPROTO)
-		return -EAFNOSUPPORT;
+    /*
+     *  Check protocol is in range
+     */
+    // 校验协议族编号是否合法
+    if(family<0 || family>=NPROTO)
+        return -EAFNOSUPPORT;
 
-	/* Compatibility.
+    /* Compatibility.
 
-	   This uglymoron is moved from INET layer to here to avoid
-	   deadlock in module load.
-	 */
-	if (family == PF_INET && type == SOCK_PACKET) {
-		static int warned; 
-		if (!warned) {
-			warned = 1;
-			printk(KERN_INFO "%s uses obsolete (PF_INET,SOCK_PACKET)\n", current->comm);
-		}
-		family = PF_PACKET;
-	}
-		
+       This uglymoron is moved from INET layer to here to avoid
+       deadlock in module load.
+     */
+    // 兼容旧用法：PF_INET + SOCK_PACKET 自动转为 PF_PACKET
+    if (family == PF_INET && type == SOCK_PACKET) {
+        static int warned; 
+        if (!warned) {
+            warned = 1;
+            printk(KERN_INFO "%s uses obsolete (PF_INET,SOCK_PACKET)\n", current->comm);
+        }
+        family = PF_PACKET;
+    }
+        
 #if defined(CONFIG_KMOD) && defined(CONFIG_NET)
-	/* Attempt to load a protocol module if the find failed. 
-	 * 
-	 * 12/09/1996 Marcin: But! this makes REALLY only sense, if the user 
-	 * requested real, full-featured networking support upon configuration.
-	 * Otherwise module support will break!
-	 */
-	if (net_families[family]==NULL)
-	{
-		char module_name[30];
-		sprintf(module_name,"net-pf-%d",family);
-		request_module(module_name);
-	}
+    /* Attempt to load a protocol module if the find failed. 
+     * 
+     * 12/09/1996 Marcin: But! this makes REALLY only sense, if the user 
+     * requested real, full-featured networking support upon configuration.
+     * Otherwise module support will break!
+     */
+    // 协议族不存在时，自动尝试加载 net-pf-xx 协议模块
+    if (net_families[family]==NULL)
+    {
+        char module_name[30];
+        sprintf(module_name,"net-pf-%d",family);
+        request_module(module_name);
+    }
 #endif
 
-	net_family_read_lock();
-	if (net_families[family] == NULL) {
-		i = -EAFNOSUPPORT;
-		goto out;
-	}
+    // 加读锁保护协议族数组 net_families
+    net_family_read_lock();
+    // 加载模块后仍然为空，说明不支持该协议族
+    if (net_families[family] == NULL) {
+        i = -EAFNOSUPPORT;
+        goto out;
+    }
 
 /*
- *	Allocate the socket and allow the family to set things up. if
- *	the protocol is 0, the family is instructed to select an appropriate
- *	default.
+ *  Allocate the socket and allow the family to set things up. if
+ *  the protocol is 0, the family is instructed to select an appropriate
+ *  default.
  */
 
-	if (!(sock = sock_alloc())) 
-	{
-		printk(KERN_WARNING "socket: no more sockets\n");
-		i = -ENFILE;		/* Not exactly a match, but its the
-					   closest posix thing */
-		goto out;
-	}
+    // 分配struct socket套接字主体
+    if (!(sock = sock_alloc())) 
+    {
+        printk(KERN_WARNING "socket: no more sockets\n");
+        i = -ENFILE;        /* Not exactly a match, but its the
+                           closest posix thing */
+        goto out;
+    }
 
-	sock->type  = type;
+    // 填入套接字类型
+    sock->type  = type;
 
-	if ((i = net_families[family]->create(sock, protocol)) < 0) 
-	{
-		sock_release(sock);
-		goto out;
-	}
+    // 调用对应协议族的create回调，inet_create / unix_create 等
+	// inet_family_ops 或者 unix_family_ops
+    if ((i = net_families[family]->create(sock, protocol)) < 0) 
+    {
+        // 协议层创建失败，释放socket对象
+        sock_release(sock);
+        goto out;
+    }
 
-	*res = sock;
+    // 回传socket对象给上层sys_socket
+    *res = sock;
 
 out:
-	net_family_read_unlock();
-	return i;
+    // 释放协议族读锁
+    net_family_read_unlock();
+    return i;
 }
 
+
+/**
+ * sys_socket - socket系统调用内核入口，创建套接字并绑定文件描述符
+ * @family: 协议族，AF_INET/AF_UNIX等
+ * @type: 套接字类型，SOCK_STREAM/SOCK_DGRAM/SOCK_RAW等
+ * @protocol: 协议编号，0代表自动选择默认协议
+ *
+ * 返回值：成功返回socket文件描述符；失败返回负的错误码
+ */
 asmlinkage long sys_socket(int family, int type, int protocol)
 {
-	int retval;
-	struct socket *sock;
+    int retval;
+    // struct socket 是BSD套接字层对象
+    struct socket *sock;
 
-	retval = sock_create(family, type, protocol, &sock);
-	if (retval < 0)
-		goto out;
+    // 创建底层socket内核对象，初始化ops、inode等，不分配fd
+    retval = sock_create(family, type, protocol, &sock);
+    if (retval < 0)
+        goto out;
 
-	retval = sock_map_fd(sock);
-	if (retval < 0)
-		goto out_release;
+    // 将socket对象映射到文件描述符，加入当前进程的fd表
+    retval = sock_map_fd(sock);
+    if (retval < 0)
+        goto out_release;
 
 out:
-	/* It may be already another descriptor 8) Not kernel problem. */
-	return retval;
+    /* It may be already another descriptor 8) Not kernel problem. */
+    return retval;
 
 out_release:
-	sock_release(sock);
-	return retval;
+    // fd分配失败，释放刚才创建的socket内核对象
+    sock_release(sock);
+    return retval;
 }
 
 /*
@@ -982,19 +1055,34 @@ out:
  *	the protocol layer (having also checked the address is ok).
  */
 
+/**
+ * sys_bind - bind系统调用内核入口函数
+ * @fd: socket对应的文件描述符
+ * @umyaddr: 用户态传入的本地地址结构体指针
+ * @addrlen: 地址结构体的有效长度
+ *
+ * 返回值：成功返回0；失败返回负的错误码
+ */
 asmlinkage long sys_bind(int fd, struct sockaddr *umyaddr, int addrlen)
 {
-	struct socket *sock;
-	char address[MAX_SOCK_ADDR];
-	int err;
+    struct socket *sock;
+    // 内核缓冲区，用来存放从用户态拷贝过来的sockaddr地址
+    char address[MAX_SOCK_ADDR];
+    int err;
 
-	if((sock = sockfd_lookup(fd,&err))!=NULL)
-	{
-		if((err=move_addr_to_kernel(umyaddr,addrlen,address))>=0)
-			err = sock->ops->bind(sock, (struct sockaddr *)address, addrlen);
-		sockfd_put(sock);
-	}			
-	return err;
+    // 根据fd查找socket对象，查找失败时err会被填充错误码
+	// inode->i_sock
+    if((sock = sockfd_lookup(fd,&err))!=NULL)
+    {
+        // 将用户态地址拷贝到内核缓冲区，同时做合法性校验
+        if((err=move_addr_to_kernel(umyaddr,addrlen,address))>=0)
+            // 调用BSD套接字层bind回调，进入proto_ops的bind函数
+			// inet_stream_ops
+            err = sock->ops->bind(sock, (struct sockaddr *)address, addrlen);
+        // 释放sock引用计数，和sockfd_lookup配对
+        sockfd_put(sock);
+    }           
+    return err;
 }
 
 
@@ -1643,64 +1731,75 @@ extern void sk_init(void);
 extern void wanrouter_init(void);
 #endif
 
+/**
+ * sock_init - socket子系统初始化入口（Linux2.4，__init只在启动阶段执行一次）
+ *
+ * 返回值：无
+ * 说明：NET4.0协议栈初始化主函数；清空协议族数组、创建sock/skbuff的slab缓存、挂载sockfs文件系统，
+ * 初始化netlink、netfilter等基础组件；各具体协议（AF_INET等）由后续do_initcalls回调注册
+ */
 void __init sock_init(void)
 {
-	int i;
+    int i;
 
-	printk(KERN_INFO "Linux NET4.0 for Linux 2.4\n");
-	printk(KERN_INFO "Based upon Swansea University Computer Society NET3.039\n");
+    printk(KERN_INFO "Linux NET4.0 for Linux 2.4\n");
+    printk(KERN_INFO "Based upon Swansea University Computer Society NET3.039\n");
 
-	/*
-	 *	Initialize all address (protocol) families. 
-	 */
-	 
-	for (i = 0; i < NPROTO; i++) 
-		net_families[i] = NULL;
+    /*
+     *  Initialize all address (protocol) families. 
+     */
+    // 清空协议族数组，net_families[]用来存放各个地址族的操作集（AF_INET、AF_UNIX等）
+    for (i = 0; i < NPROTO; i++) 
+        net_families[i] = NULL;
 
-	/*
-	 *	Initialize sock SLAB cache.
-	 */
-	 
-	sk_init();
+    /*
+     *  Initialize sock SLAB cache.
+     */
+    // 创建struct sock专用slab缓存，后续分配sk都走这个缓存
+    sk_init();
 
 #ifdef SLAB_SKB
-	/*
-	 *	Initialize skbuff SLAB cache 
-	 */
-	skb_init();
+    /*
+     *  Initialize skbuff SLAB cache 
+     */
+    // 创建sk_buff报文缓冲区slab缓存
+    skb_init();
 #endif
 
-	/*
-	 *	Wan router layer. 
-	 */
-
-#ifdef CONFIG_WAN_ROUTER	 
-	wanrouter_init();
+    /*
+     *  Wan router layer. 
+     */
+#ifdef CONFIG_WAN_ROUTER     
+    // 广域网路由层初始化（可选编译项）
+    wanrouter_init();
 #endif
 
-	/*
-	 *	Initialize the protocols module. 
-	 */
+    /*
+     *  Initialize the protocols module. 
+     */
+    // 注册sockfs文件系统类型，socket依赖sockfs
+    register_filesystem(&sock_fs_type);
+    // 内核挂载sockfs，sock_mnt保存挂载点，socket的inode就在这个文件系统上
+    sock_mnt = kern_mount(&sock_fs_type);
+    /* The real protocol initialization is performed when
+     *  do_initcalls is run.  
+     */
+    // 注释：TCP/UDP/IP等具体协议真正的初始化，是在do_initcalls里面通过__initcall执行
 
-	register_filesystem(&sock_fs_type);
-	sock_mnt = kern_mount(&sock_fs_type);
-	/* The real protocol initialization is performed when
-	 *  do_initcalls is run.  
-	 */
-
-
-	/*
-	 * The netlink device handler may be needed early.
-	 */
-
+    /*
+     * The netlink device handler may be needed early.
+     */
 #ifdef  CONFIG_RTNETLINK
-	rtnetlink_init();
+    // 路由netlink初始化，用户态操作路由表用
+    rtnetlink_init();
 #endif
 #ifdef CONFIG_NETLINK_DEV
-	init_netlink();
+    // 通用netlink设备初始化
+    init_netlink();
 #endif
 #ifdef CONFIG_NETFILTER
-	netfilter_init();
+    // netfilter框架初始化！就是你前面问的iptables底层钩子框架
+    netfilter_init();
 #endif
 }
 

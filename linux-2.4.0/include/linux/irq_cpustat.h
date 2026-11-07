@@ -26,7 +26,10 @@ extern irq_cpustat_t irq_stat[];			/* defined in asm/hardirq.h */
 #endif	
 
   /* arch independent irq_stat fields */
+// __softirq_active 判断
 #define softirq_active(cpu)	__IRQ_STAT((cpu), __softirq_active)
+
+// __softirq_mask 判断
 #define softirq_mask(cpu)	__IRQ_STAT((cpu), __softirq_mask)
 #define local_irq_count(cpu)	__IRQ_STAT((cpu), __local_irq_count)
 #define local_bh_count(cpu)	__IRQ_STAT((cpu), __local_bh_count)

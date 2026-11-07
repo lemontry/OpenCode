@@ -25,17 +25,58 @@
  * loads pretty fast by getting whole tracks at a time whenever possible.
  */
 
+/**
+ * bootsect.S - Linux 2.4 x86 软盘一级引导扇区（512字节，16位实模式）
+ * 执行时机：BIOS自检完成后，读取软盘第0扇区加载到物理地址0x7C00，跳转此处开始执行。
+ * 依赖：仅使用BIOS中断 int 0x10(视频)、int 0x13(软盘IO)，无保护模式、无分页、无C运行库。
+ * 核心流程：
+ * 1. 自搬迁：将自身512字节代码从0x7C00拷贝到0x90000，避免后续加载setup时覆盖自身；
+ * 2. 栈初始化 + 修改BIOS软盘参数表：复制原生磁盘参数表，修改单次最大读取扇区为36，突破BIOS默认一次最多读7扇区的限制，加速批量读盘；
+ * 3. 加载setup模块：循环重试读取setup扇区到0x90200；setup是二级引导，负责采集BIOS硬件信息、准备环境、切换保护模式、解压zImage内核；
+ * 4. 软盘规格探测：BIOS没有直接获取每轨扇区数的接口，依次试探36/18/15/9，自动识别软盘类型；识别成功后屏幕打印"Loading..."；
+ * 5. 加载内核镜像：将压缩内核zImage读到0x10000；读取逻辑保证不跨64KB段边界（BIOS int 13h的硬件限制），优先整轨读取提升速度，读失败时打印寄存器和错误码用于调试；
+ * 6. 根设备自动判定：若编译未指定root_dev，则根据软盘规格自动分配对应的软盘根设备号，内核启动后依靠root_dev挂载根文件系统；
+ * 7. 收尾：调用kill_motor关闭软盘电机，然后远跳转进入setup交出执行权，bootsect不再参与后续流程；
+ * 8. 扇区尾部预留参数区，供build工具填充配置，最后两字节固定魔数0xAA55，是BIOS识别合法引导扇区的标志；
+ * 局限：该版本仅面向软盘启动；只负责搬运数据，不解析ELF，不开启保护模式，保护模式切换、内核解压都交给setup.S完成。
+
+磁盘逻辑扇区	内容			占用扇区数		被加载到内存地址
+0				bootsect.S		1				0x7C00，之后自搬迁到 0x90000
+1				setup.S			1				0x90200
+2				setup.S			1				0x90200+0x200
+3				setup.S			1				0x90200+0x400
+4				setup.S			1				0x90200+0x600
+5 ~ ...			zImage（压缩内核）	剩余		  0x10000
+ */
+
 #include <linux/config.h>		/* for CONFIG_ROOT_RDONLY */
 #include <asm/boot.h>
 
+// 宏定义：段地址（实模式：段<<4 + 偏移 = 物理地址）
+
+// setup模块默认占用扇区数量
 SETUPSECS	= 4			/* default nr of setup-sectors */
+
+// bootsect初始加载段：0x07C0 <<4 = 0x7C00
 BOOTSEG		= 0x07C0		/* original address of boot-sector */
+
+// bootsect搬迁目标段 0x9000
 INITSEG		= DEF_INITSEG		/* we move boot here - out of the way */
+
+// setup模块加载段 0x9020
 SETUPSEG	= DEF_SETUPSEG		/* setup starts here */
+
+// 内核镜像加载段 0x1000
 SYSSEG		= DEF_SYSSEG		/* system loaded at 0x10000 (65536) */
+
+// 内核大小单位：16字节为1个click
 SYSSIZE		= DEF_SYSSIZE		/* system size: # of 16-byte clicks */
 					/* to be loaded */
+
+// 根设备号，build工具后期填充，0代表自动探测
 ROOT_DEV	= 0 			/* ROOT_DEV is now written by "build" */
+
+// 交换设备号
 SWAP_DEV	= 0			/* SWAP_DEV is now written by "build" */
 
 #ifndef SVGA_MODE
@@ -56,21 +97,23 @@ SWAP_DEV	= 0			/* SWAP_DEV is now written by "build" */
 .global _start
 _start:
 
+/* 调试断点，int 0x3 断点中断；部分老旧BIOS会异常，默认关闭 */
 #if 0 /* hook for debugger, harmless unless BIOS is fussy (old HP) */
 	int	$0x3
 #endif
 
+	// 1. 自搬迁：把bootsect自身512字节，从0x7C00复制到0x90000
 	movw	$BOOTSEG, %ax
 	movw	%ax, %ds
 	movw	$INITSEG, %ax
 	movw	%ax, %es
-	movw	$256, %cx
+	movw	$256, %cx  // 256个word = 512字节
 	subw	%si, %si
 	subw	%di, %di
 	cld
 	rep
-	movsw
-	ljmp	$INITSEG, $go
+	movsw  // 循环拷贝
+	ljmp	$INITSEG, $go  // 远跳转，跳到搬迁后代码的go标签
 
 # bde - changed 0xff00 to 0x4000 to use debugger at 0x6400 up (bde).  We
 # wouldn't have to worry about this if we checked the top of memory.  Also
@@ -78,12 +121,17 @@ _start:
 # instead of in the vector table.  The old stack might have clobbered the
 # drive table.
 
+// 搬迁完成后，切换栈，准备运行
+// 栈顶位置，预留12字节存放软盘参数表
 go:	movw	$0x4000-12, %di		# 0x4000 is an arbitrary value >=
 					# length of bootsect + length of
 					# setup + room for stack;
 					# 12 is disk parm size.
+	// ds=INITSEG
 	movw	%ax, %ds		# ax and es already contain INITSEG
+	// ss栈段=INITSEG
 	movw	%ax, %ss
+	// 设置栈指针
 	movw	%di, %sp		# put stack at INITSEG:0x4000-12.
 
 # Many BIOS's default disk parameter tables will not recognize
@@ -101,6 +149,7 @@ go:	movw	$0x4000-12, %di		# 0x4000 is an arbitrary value >=
 # Segments are as follows: ds = es = ss = cs - INITSEG, fs = 0,
 # and gs is unused.
 
+	// 拷贝BIOS默认软盘参数表，并修改单轨最大读取扇区为36，加速批量读盘
 	movw	%cx, %fs		# set fs to 0
 	movw	$0x78, %bx		# fs:bx is parameter table address
 	pushw	%ds
@@ -111,7 +160,7 @@ go:	movw	$0x4000-12, %di		# 0x4000 is an arbitrary value >=
 	movsw
 	popw	%di
 	popw	%ds
-	movb	$36, 0x4(%di)		# patch sector count
+	movb	$36, 0x4(%di)		# patch sector count  // 修改单次最大读取扇区数为36（适配2.88M软盘）
 	movw	%di, %fs:(%bx)
 	movw	%es, %fs:2(%bx)
 
@@ -119,6 +168,7 @@ go:	movw	$0x4000-12, %di		# 0x4000 is an arbitrary value >=
 # Note that 'es' is already set up.
 # Also, cx = 0 from rep movsw above.
 
+// 加载setup模块到bootsect后面（0x90200）
 load_setup:
 	xorb	%ah, %ah		# reset FDC 
 	xorb	%dl, %dl
@@ -129,14 +179,15 @@ load_setup:
 	movb	$0x02, %ah		# service 2, "read sector(s)"
 	movb	setup_sects, %al	# (assume all on head 0, track 0)
 	int	$0x13			# read it
-	jnc	ok_load_setup		# ok - continue
+	jnc	ok_load_setup		# ok - continue   // CF=0无错，跳转
 
+	// 读取出错，打印错误码
 	pushw	%ax			# dump error code
 	call	print_nl
 	movw	%sp, %bp
 	call	print_hex
 	popw	%ax	
-	jmp	load_setup
+	jmp	load_setup   // 出错重试
 
 ok_load_setup:
 # Get disk drive parameters, specifically number of sectors/track.
@@ -145,6 +196,7 @@ ok_load_setup:
 # Guess 36 sectors if sector 36 can be read, 18 sectors if sector 18
 # can be read, 15 if sector 15 can be read.  Otherwise guess 9.
 
+	// 探测软盘每轨扇区数量：无直接BIOS调用，依次尝试36/18/15/9
 	movw	$disksizes, %si		# table of sizes to try
 probe_loop:
 	lodsb
@@ -164,6 +216,7 @@ probe_loop:
 	jc	probe_loop		# try next value
 
 got_sectors:
+	// 打印 "Loading..." 提示信息
 	movw	$INITSEG, %ax
 	movw	%ax, %es		# set up es
 	movb	$0x03, %ah		# read cursor pos
@@ -176,8 +229,8 @@ got_sectors:
 	int	$0x10			# tell the user we're loading..
 	movw	$SYSSEG, %ax		# ok, we've written the message, now
 	movw	%ax, %es		# we want to load system (at 0x10000)
-	call	read_it
-	call	kill_motor
+	call	read_it  // 加载内核镜像
+	call	kill_motor  // 关闭软盘电机
 	call	print_nl
 
 # After that we check which root-device to use. If the device is
@@ -209,6 +262,7 @@ root_defined:
 # After that (everything loaded), we jump to the setup-routine
 # loaded directly after the bootblock:
 
+	// 全部加载完成，远跳转到setup，交出控制权
 	ljmp	$SETUPSEG, $0
 
 # This routine loads the system at address 0x10000, making sure
@@ -216,6 +270,8 @@ root_defined:
 # possible, loading whole tracks whenever we can.
 
 # es = starting address segment (normally 0x1000)
+
+// ---------------- read_it：加载内核到0x10000，保证不跨64KB段边界 ----------------
 
 sread:	.word 0				# sectors read of current track
 head:	.word 0				# current head

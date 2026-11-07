@@ -89,11 +89,19 @@ typedef struct __wait_queue wait_queue_t;
 # define wq_write_unlock spin_unlock
 #endif
 
+/**
+ * struct __wait_queue_head - Linux2.4 等待队列头
+ * 等待队列头是一个链表的 “表头 + 保护锁”，用来统一管理一堆正在阻塞等待某个条件的进程节点（wait_queue_t)
+ */
 struct __wait_queue_head {
+	// 保护task_list链表的锁，wq_lock_t 在2.4上一般就是spinlock_t
 	wq_lock_t lock;
+	// 等待进程节点链表头，所有等待在这个队列上的wait_queue_t挂到此链表
 	struct list_head task_list;
 #if WAITQUEUE_DEBUG
+	// 调试魔数，开启WAITQUEUE_DEBUG才编译，校验结构体合法性
 	long __magic;
+	// 调试字段，记录创建该等待队列的进程，debug用
 	long __creator;
 #endif
 };
@@ -121,17 +129,26 @@ typedef struct __wait_queue_head wait_queue_head_t;
 #define DECLARE_WAIT_QUEUE_HEAD(name) \
 	wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
 
+/**
+ * init_waitqueue_head - 初始化等待队列头 wait_queue_head_t（Linux2.4）
+ * @q: 等待队列头指针
+ */
 static inline void init_waitqueue_head(wait_queue_head_t *q)
 {
 #if WAITQUEUE_DEBUG
-	if (!q)
-		WQ_BUG();
+    // 调试模式：空指针检查，触发BUG
+    if (!q)
+        WQ_BUG();
 #endif
-	q->lock = WAITQUEUE_RW_LOCK_UNLOCKED;
-	INIT_LIST_HEAD(&q->task_list);
+    // 初始化保护链表的自旋锁，设置为未上锁状态
+    q->lock = WAITQUEUE_RW_LOCK_UNLOCKED;
+    // 初始化双向链表头 task_list，链表初始为空
+    INIT_LIST_HEAD(&q->task_list);
 #if WAITQUEUE_DEBUG
-	q->__magic = (long)&q->__magic;
-	q->__creator = (long)current_text_addr();
+    // 调试魔数：用自身地址作为magic，用来检测结构体越界/损坏
+    q->__magic = (long)&q->__magic;
+    // 记录创建这个等待队列头的代码地址，定位来源
+    q->__creator = (long)current_text_addr();
 #endif
 }
 
@@ -170,6 +187,7 @@ static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
 	if (!head->task_list.next || !head->task_list.prev)
 		WQ_BUG();
 #endif
+	//添加到 head 后面
 	list_add(&new->task_list, &head->task_list);
 }
 

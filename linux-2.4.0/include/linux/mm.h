@@ -38,34 +38,53 @@ extern struct list_head inactive_dirty_list;
  * space that has a special rule for the page-fault handlers (ie a shared
  * library, the executable area etc).
  */
+/**
+ * vm_area_struct - 虚拟内存区域VMA，描述进程地址空间里一段连续虚拟区间，Linux2.4
+ */
 struct vm_area_struct {
-	struct mm_struct * vm_mm;	/* VM area parameters */
-	unsigned long vm_start;
-	unsigned long vm_end;
+    // 归属的进程内存描述符
+    struct mm_struct * vm_mm;   /* VM area parameters */
+    // VMA起始虚拟地址
+    unsigned long vm_start;
+    // VMA结束虚拟地址，[vm_start, vm_end)
+    unsigned long vm_end;
 
-	/* linked list of VM areas per task, sorted by address */
-	struct vm_area_struct *vm_next;
+    /* linked list of VM areas per task, sorted by address */
+    // VMA单向链表，按虚拟地址从小到大串联
+    struct vm_area_struct *vm_next;
 
-	pgprot_t vm_page_prot;
-	unsigned long vm_flags;
+    // 该区域页保护属性
+    pgprot_t vm_page_prot;
+    // VMA标志位：VM_READ / VM_WRITE / VM_EXEC / VM_SHARED等
+    unsigned long vm_flags;
 
-	/* AVL tree of VM areas per task, sorted by address */
-	short vm_avl_height;
-	struct vm_area_struct * vm_avl_left;
-	struct vm_area_struct * vm_avl_right;
+    /* AVL tree of VM areas per task, sorted by address */
+    // AVL树高度，用于VMA快速查找
+    short vm_avl_height;
+    // AVL树左子节点
+    struct vm_area_struct * vm_avl_left;
+    // AVL树右子节点
+    struct vm_area_struct * vm_avl_right;
 
-	/* For areas with an address space and backing store,
-	 * one of the address_space->i_mmap{,shared} lists,
-	 * for shm areas, the list of attaches, otherwise unused.
-	 */
-	struct vm_area_struct *vm_next_share;
-	struct vm_area_struct **vm_pprev_share;
+    /* For areas with an address space and backing store,
+     * one of the address_space->i_mmap{,shared} lists,
+     * for shm areas, the list of attaches, otherwise unused.
+     */
+    // 文件/共享内存映射链表后继
+    struct vm_area_struct *vm_next_share;
+    // 共享链表前驱二级指针，O(1)删除
+    struct vm_area_struct **vm_pprev_share;
 
-	struct vm_operations_struct * vm_ops;
-	unsigned long vm_pgoff;		/* offset in PAGE_SIZE units, *not* PAGE_CACHE_SIZE */
-	struct file * vm_file;
-	unsigned long vm_raend;
-	void * vm_private_data;		/* was vm_pte (shared mem) */
+    // VMA回调操作集，缺页、打开、关闭等
+    struct vm_operations_struct * vm_ops;
+    // 后端文件内偏移，单位PAGE_SIZE页
+    unsigned long vm_pgoff;     /* offset in PAGE_SIZE units, *not* PAGE_CACHE_SIZE */
+    // 映射关联的文件，匿名映射为NULL
+    struct file * vm_file;
+    // 文件预读终点地址
+    unsigned long vm_raend;
+    // VMA私有数据
+    void * vm_private_data;     /* was vm_pte (shared mem) */
 };
 
 /*
@@ -117,9 +136,16 @@ extern pgprot_t protection_map[16];
  * unmapping it (needed to keep files on disk up-to-date etc), pointer
  * to the functions called when a no-page or a wp-page exception occurs. 
  */
+/**
+ * vm_operations_struct - VMA操作回调集合，Linux2.4
+ * 不同类型虚拟内存区域挂载各自的回调实现，用于处理VMA生命周期与缺页
+ */
 struct vm_operations_struct {
+	// VMA创建/复制时触发
 	void (*open)(struct vm_area_struct * area);
+	// VMA销毁时触发
 	void (*close)(struct vm_area_struct * area);
+	// 缺页异常回调，返回对应的struct page
 	struct page * (*nopage)(struct vm_area_struct * area, unsigned long address, int write_access);
 };
 
@@ -131,21 +157,42 @@ struct vm_operations_struct {
  * The first line is data used in page cache lookup, the second line
  * is used for linear searches (eg. clock algorithm scans). 
  */
+/**
+ * struct page - 描述一个物理页帧的内核管理结构，Linux2.4
+ * 
+`mapping + index` 是文件页核心：
+- 文件页：mapping 指向文件 inode 的 address_space，index 是文件内页偏移
+- 匿名页：mapping=NULL，属于进程匿名内存
+ */
 typedef struct page {
-	struct list_head list;
-	struct address_space *mapping;
-	unsigned long index;
-	struct page *next_hash;
-	atomic_t count;
-	unsigned long flags;	/* atomic flags, some possibly updated asynchronously */
-	struct list_head lru;
-	unsigned long age;
-	wait_queue_head_t wait;
-	struct page **pprev_hash;
-	struct buffer_head * buffers;
-	void *virtual; /* non-NULL if kmapped */
-	struct zone_struct *zone;
+    // 通用链表节点，伙伴系统、slab等场景使用
+    struct list_head list;
+    // 归属的地址空间，文件页、匿名页都挂在address_space下
+    struct address_space *mapping;
+    // 在address_space中的页索引号
+    unsigned long index;
+    // page缓存哈希表后继指针
+    struct page *next_hash;
+    // 页的引用计数，原子操作
+    atomic_t count;
+    // 页标志位，原子标志，部分可异步更新
+    unsigned long flags;    /* atomic flags, some possibly updated asynchronously */
+    // LRU链表节点，kswap页面回收
+    struct list_head lru;
+    // 页面老化值，用于冷热页判定
+    unsigned long age;
+    // 等待该页的等待队列头
+    wait_queue_head_t wait;
+    // 哈希链表前驱二级指针，方便O(1)删除
+    struct page **pprev_hash;
+    // 关联的buffer_head，块缓冲
+    struct buffer_head * buffers;
+    // kmap映射得到的虚拟地址，非NULL代表已经kmapped
+    void *virtual; /* non-NULL if kmapped */
+    // 该页所属内存zone
+    struct zone_struct *zone;
 } mem_map_t;
+
 
 #define get_page(p)		atomic_inc(&(p)->count)
 #define put_page(p)		__free_page(p)
@@ -486,21 +533,34 @@ extern struct page *filemap_nopage(struct vm_area_struct *, unsigned long, int);
 
 /* vma is the first one with  address < vma->vm_end,
  * and even  address < vma->vm_start. Have to extend vma. */
+/**
+ * expand_stack - 向上扩展栈VMA，栈缺页时扩大栈的虚拟地址区间，Linux2.4
+ * @vma: 栈对应的VMA
+ * @address: 触发栈扩展的缺页虚拟地址
+ * 返回值: 0 扩展成功；-ENOMEM 超出资源限制，扩展失败
+ */
 static inline int expand_stack(struct vm_area_struct * vma, unsigned long address)
 {
-	unsigned long grow;
+    unsigned long grow;
 
-	address &= PAGE_MASK;
-	grow = (vma->vm_start - address) >> PAGE_SHIFT;
-	if (vma->vm_end - address > current->rlim[RLIMIT_STACK].rlim_cur ||
-	    ((vma->vm_mm->total_vm + grow) << PAGE_SHIFT) > current->rlim[RLIMIT_AS].rlim_cur)
-		return -ENOMEM;
-	vma->vm_start = address;
-	vma->vm_pgoff -= grow;
-	vma->vm_mm->total_vm += grow;
-	if (vma->vm_flags & VM_LOCKED)
-		vma->vm_mm->locked_vm += grow;
-	return 0;
+    // 对齐到页边界
+    address &= PAGE_MASK;
+    // 计算需要向上增长的页数
+    grow = (vma->vm_start - address) >> PAGE_SHIFT;
+    // 检查栈上限RLIMIT_STACK、地址空间上限RLIMIT_AS，任一超限返回失败
+    if (vma->vm_end - address > current->rlim[RLIMIT_STACK].rlim_cur ||
+        ((vma->vm_mm->total_vm + grow) << PAGE_SHIFT) > current->rlim[RLIMIT_AS].rlim_cur)
+        return -ENOMEM;
+    // 更新VMA起始地址，栈向上扩展
+    vma->vm_start = address;
+    // 调整VMA页偏移
+    vma->vm_pgoff -= grow;
+    // 进程总虚拟页数增加
+    vma->vm_mm->total_vm += grow;
+    // 如果VMA是锁定状态，增加锁定页数统计
+    if (vma->vm_flags & VM_LOCKED)
+        vma->vm_mm->locked_vm += grow;
+    return 0;
 }
 
 /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */

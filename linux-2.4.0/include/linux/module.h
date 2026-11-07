@@ -28,68 +28,115 @@
 struct exception_table_entry;
 
 /* Used by get_kernel_syms, which is obsolete.  */
+/**
+ * struct kernel_sym
+ * 内核原始导出符号条目（链接脚本 __ksymtab 里的原始条目）
+ */
 struct kernel_sym
 {
-	unsigned long value;
-	char name[60];		/* should have been 64-sizeof(long); oh well */
+    unsigned long value;
+    char name[60];       /* should have been 64-sizeof(long); oh well */
 };
 
+/**
+ * struct module_symbol
+ * 动态模块自己的导出符号条目，放在module->syms指向的数组
+ */
 struct module_symbol
 {
-	unsigned long value;
-	const char *name;
+    unsigned long value;
+    const char *name;
 };
 
+/**
+ * struct module_ref
+ * 模块依赖引用节点，用来维护模块之间依赖关系
+ */
 struct module_ref
 {
-	struct module *dep;	/* "parent" pointer */
-	struct module *ref;	/* "child" pointer */
-	struct module_ref *next_ref;
+    struct module *dep; /* "parent" pointer 被依赖模块（我依赖dep） */
+    struct module *ref; /* "child" pointer 依赖方模块（ref依赖我） */
+    struct module_ref *next_ref;
 };
+
 
 /* TBD */
 struct module_persist;
-
+/**
+ * struct module - Linux 2.4 内核动态模块描述结构体
+ * 每个动态加载ko对应一个；kernel_module是静态实例代表内核本身
+ */
 struct module
 {
-	unsigned long size_of_struct;	/* == sizeof(module) */
-	struct module *next;
-	const char *name;
-	unsigned long size;
+    // 结构体自身大小，用于版本兼容校验，防止用户态modutils和内核版本不匹配
+    unsigned long size_of_struct;   /* == sizeof(module) */
+    // 链表指针，挂入全局 module_list 单向链表
+    struct module *next;
+    // 模块名字字符串
+    const char *name;
+    // 模块整体镜像占用字节大小（代码+数据+bss）
+    unsigned long size;
 
-	union
-	{
-		atomic_t usecount;
-		long pad;
-	} uc;				/* Needs to keep its size - so says rth */
+    union
+    {
+        // 模块引用计数：MOD_INC_USE_COUNT / MOD_DEC_USE_COUNT 操作它
+        atomic_t usecount;
+        // pad 填充，保证联合体整体大小固定，兼容不同对齐、架构
+        long pad;
+    } uc;   /* Needs to keep its size - so says rth */
 
-	unsigned long flags;		/* AUTOCLEAN et al */
+    // 模块状态标志位：MOD_RUNNING、AUTOCLEAN 等
+    unsigned long flags;            /* AUTOCLEAN et al */
 
-	unsigned nsyms;
-	unsigned ndeps;
+    // nsyms：导出符号的数量
+    unsigned nsyms;
+    // ndeps：依赖其他模块的数量
+    unsigned ndeps;
 
-	struct module_symbol *syms;
-	struct module_ref *deps;
-	struct module_ref *refs;
-	int (*init)(void);
-	void (*cleanup)(void);
-	const struct exception_table_entry *ex_table_start;
-	const struct exception_table_entry *ex_table_end;
+    // syms：导出符号表数组首地址，struct module_symbol[]
+    struct module_symbol *syms;
+    // deps：本模块依赖的模块列表
+    struct module_ref *deps;
+    // refs：依赖本模块的其他模块列表（反向引用）
+    struct module_ref *refs;
+
+    // 模块初始化入口函数，sys_init_module 里调用
+    int (*init)(void);
+    // 模块卸载清理入口函数，sys_delete_module 里调用
+    void (*cleanup)(void);
+
+    // 模块的异常修正表起止，处理 copy_from_user 等用户空间访问异常
+    const struct exception_table_entry *ex_table_start;
+    const struct exception_table_entry *ex_table_end;
+
 #ifdef __alpha__
-	unsigned long gp;
+    // alpha架构gp全局指针，其他架构不使用
+    unsigned long gp;
 #endif
-	/* Members past this point are extensions to the basic
-	   module support and are optional.  Use mod_member_present()
-	   to examine them.  */
-	const struct module_persist *persist_start;
-	const struct module_persist *persist_end;
-	int (*can_unload)(void);
-	int runsize;			/* In modutils, not currently used */
-	const char *kallsyms_start;	/* All symbols for kernel debugging */
-	const char *kallsyms_end;
-	const char *archdata_start;	/* arch specific data for module */
-	const char *archdata_end;
-	const char *kernel_data;	/* Reserved for kernel internal use */
+    /* Members past this point are extensions to the basic
+       module support and are optional.  Use mod_member_present()
+       to examine them.  */
+    // 下面属于扩展字段，老版本modutils可能不支持，用mod_member_present判断是否存在
+
+    // persist：持久化数据段（模块热插拔持久保存，较少使用）
+    const struct module_persist *persist_start;
+    const struct module_persist *persist_end;
+
+    // can_unload：回调函数，额外判断是否允许卸载模块
+    int (*can_unload)(void);
+    // runsize：modutils预留字段，内核2.4没有实际使用
+    int runsize;                /* In modutils, not currently used */
+
+    // kallsyms 模块全部符号起止，oops、kdb调试打印函数名
+    const char *kallsyms_start; /* All symbols for kernel debugging */
+    const char *kallsyms_end;
+
+    // 架构相关私有数据段
+    const char *archdata_start; /* arch specific data for module */
+    const char *archdata_end;
+
+    // 内核保留字段
+    const char *kernel_data;    /* Reserved for kernel internal use */
 };
 
 struct module_info
@@ -113,11 +160,11 @@ struct module_info
 
 /* Values for query_module's which.  */
 
-#define QM_MODULES	1
-#define QM_DEPS		2
-#define QM_REFS		3
-#define QM_SYMBOLS	4
-#define QM_INFO		5
+#define QM_MODULES      1   // 所有模块名列表
+#define QM_DEPS         2   // 依赖的模块
+#define QM_REFS         3   // 引用本模块的模块
+#define QM_SYMBOLS      4   // 导出符号表（最重要）
+#define QM_INFO         5   // 模块基础信息
 
 /* Can the module be queried? */
 #define MOD_CAN_QUERY(mod) (((mod)->flags & (MOD_RUNNING | MOD_INITIALIZING)) && !((mod)->flags & MOD_DELETED))
@@ -329,6 +376,7 @@ const struct module_symbol __ksymtab_##sym 		\
 __attribute__((section("__ksymtab"))) =			\
 { (unsigned long)&sym, __kstrtab_##sym }
 
+//符号是否支持版本变动
 #if defined(MODVERSIONS) || !defined(CONFIG_MODVERSIONS)
 #define EXPORT_SYMBOL(var)  __EXPORT_SYMBOL(var, __MODULE_STRING(var))
 #else

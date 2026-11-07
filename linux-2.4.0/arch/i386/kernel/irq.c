@@ -422,30 +422,42 @@ void __global_restore_flags(unsigned long flags)
  * waste of time and is not what some drivers would
  * prefer.
  */
+// Linux2.4 遍历IRQ动作链表，执行驱动注册的中断处理函数
+// 入参 irq: 中断号；regs: 寄存器现场；action: irqaction链表头节点
 int handle_IRQ_event(unsigned int irq, struct pt_regs * regs, struct irqaction * action)
 {
-	int status;
-	int cpu = smp_processor_id();
+    int status;
+    // 获取当前CPU编号
+    int cpu = smp_processor_id();
 
-	irq_enter(cpu, irq);
+    // 进入中断上下文：更新irq_cpustat的中断计数，标记当前CPU正在处理中断
+    irq_enter(cpu, irq);
 
-	status = 1;	/* Force the "do bottom halves" bit */
+    status = 1; /* Force the "do bottom halves" bit */
+    // 如果驱动没有设置SA_INTERRUPT标志，则开启本地中断（允许中断嵌套）
+    if (!(action->flags & SA_INTERRUPT))
+        __sti();
 
-	if (!(action->flags & SA_INTERRUPT))
-		__sti();
+    // 循环遍历irqaction单向链表，执行所有注册的中断handler（支持共享中断）
+    do {
+        // 收集所有action的flags到status变量
+        status |= action->flags;
+        // 调用驱动注册的中断服务函数
+        action->handler(irq, action->dev_id, regs);
+        // 移动到链表下一个节点
+        action = action->next;
+    } while (action);
 
-	do {
-		status |= action->flags;
-		action->handler(irq, action->dev_id, regs);
-		action = action->next;
-	} while (action);
-	if (status & SA_SAMPLE_RANDOM)
-		add_interrupt_randomness(irq);
-	__cli();
+    // 如果标记SA_SAMPLE_RANDOM，采集中断时间信息，作为内核随机数熵源
+    if (status & SA_SAMPLE_RANDOM)
+        add_interrupt_randomness(irq);
 
-	irq_exit(cpu, irq);
+    // 关闭本地中断
+    __cli();
+    // 退出中断上下文，减少中断计数；退出前会检查并处理软中断
+    irq_exit(cpu, irq);
 
-	return status;
+    return status;
 }
 
 /*
@@ -466,17 +478,19 @@ int handle_IRQ_event(unsigned int irq, struct pt_regs * regs, struct irqaction *
  *	This function may be called from IRQ context.
  */
  
-void inline disable_irq_nosync(unsigned int irq)
+// Linux2.4 屏蔽指定IRQ，不等待正在执行的中断处理函数（nosync = no sync，无同步等待）
+static void inline disable_irq_nosync(unsigned int irq)
 {
-	irq_desc_t *desc = irq_desc + irq;
-	unsigned long flags;
-
-	spin_lock_irqsave(&desc->lock, flags);
-	if (!desc->depth++) {
-		desc->status |= IRQ_DISABLED;
-		desc->handler->disable(irq);
-	}
-	spin_unlock_irqrestore(&desc->lock, flags);
+    irq_desc_t *desc = irq_desc + irq;   // 获取该中断对应的irq_desc描述符
+    unsigned long flags;
+    // 获取irq_desc的自旋锁，同时保存当前CPU中断标志
+    spin_lock_irqsave(&desc->lock, flags);
+    // depth是嵌套计数：depth++，如果递增前是0，代表第一次屏蔽这个irq
+    if (!desc->depth++) {
+        desc->status |= IRQ_DISABLED;   // 设置状态标记：该IRQ已被禁用
+        desc->handler->disable(irq);    // 调用中断控制器hw_interrupt_type的disable回调，硬件屏蔽该IRQ
+    }
+    spin_unlock_irqrestore(&desc->lock, flags); // 释放自旋锁，恢复之前的中断标志
 }
 
 /**
@@ -492,16 +506,20 @@ void inline disable_irq_nosync(unsigned int irq)
  *	This function may be called - with care - from IRQ context.
  */
  
+// Linux2.4 关闭指定irq，并且等待正在执行的该irq中断处理完成
 void disable_irq(unsigned int irq)
 {
-	disable_irq_nosync(irq);
-
-	if (!local_irq_count(smp_processor_id())) {
-		do {
-			barrier();
-		} while (irq_desc[irq].status & IRQ_INPROGRESS);
-	}
+    // 第一步：关闭该irq（屏蔽中断控制器上对应的irq，不会等待）
+    disable_irq_nosync(irq);
+    // 判断：当前CPU不在硬中断上下文（local_irq_count == 0）
+    if (!local_irq_count(smp_processor_id())) {
+        // 循环等待：直到该irq没有正在执行的handler（IRQ_INPROGRESS清除）
+        do {
+            barrier();
+        } while (irq_desc[irq].status & IRQ_INPROGRESS);
+    }
 }
+
 
 /**
  *	enable_irq - enable interrupt handling on an irq
@@ -513,31 +531,36 @@ void disable_irq(unsigned int irq)
  *	This function may be called from IRQ context.
  */
  
+// Linux2.4 打开指定IRQ，和disable_irq / disable_irq_nosync配对
 void enable_irq(unsigned int irq)
 {
-	irq_desc_t *desc = irq_desc + irq;
-	unsigned long flags;
+    irq_desc_t *desc = irq_desc + irq;  // 获取该中断描述符
+    unsigned long flags;
+    // 加锁+保存中断标志，保护irq_desc并发访问
+    spin_lock_irqsave(&desc->lock, flags);
+    switch (desc->depth) {
+    case 1: {
+        // depth=1：本次enable之后，屏蔽计数即将归零，可以真正打开硬件中断
+        unsigned int status = desc->status & ~IRQ_DISABLED;
+        desc->status = status;  // 清除禁用标记 IRQ_DISABLED
 
-	spin_lock_irqsave(&desc->lock, flags);
-	switch (desc->depth) {
-	case 1: {
-		unsigned int status = desc->status & ~IRQ_DISABLED;
-		desc->status = status;
-		if ((status & (IRQ_PENDING | IRQ_REPLAY)) == IRQ_PENDING) {
-			desc->status = status | IRQ_REPLAY;
-			hw_resend_irq(desc->handler,irq);
-		}
-		desc->handler->enable(irq);
-		/* fall-through */
-	}
-	default:
-		desc->depth--;
-		break;
-	case 0:
-		printk("enable_irq(%u) unbalanced from %p\n", irq,
-		       __builtin_return_address(0));
-	}
-	spin_unlock_irqrestore(&desc->lock, flags);
+        // 如果存在待处理的挂起中断 IRQ_PENDING
+        if ((status & (IRQ_PENDING | IRQ_REPLAY)) == IRQ_PENDING) {
+            desc->status = status | IRQ_REPLAY;
+            hw_resend_irq(desc->handler,irq); // 重发这个挂起的中断
+        }
+        desc->handler->enable(irq); // 调用中断控制器的enable，硬件打开IRQ
+        /* fall-through 故意穿透到default，执行depth-- */
+    }
+    default:
+        desc->depth--;
+        break;
+    case 0:
+        // depth已经是0，说明enable次数 > disable次数，不平衡，打印警告
+        printk("enable_irq(%u) unbalanced from %p\n", irq,
+               __builtin_return_address(0));
+    }
+    spin_unlock_irqrestore(&desc->lock, flags);
 }
 
 /*
@@ -545,86 +568,122 @@ void enable_irq(unsigned int irq)
  * SMP cross-CPU interrupts have their own specific
  * handlers).
  */
+/**
+ * do_IRQ - 硬件中断核心C处理入口（Linux2.4 i386，arch/i386/kernel/irq.c）
+ * @regs: 栈上保存的寄存器上下文，SAVE_ALL构建的pt_regs
+ * 返回值：固定返回1（汇编层使用）
+ *
+ * 调用来源：entry.S common_interrupt 中 call do_IRQ
+ */
 asmlinkage unsigned int do_IRQ(struct pt_regs regs)
-{	
-	/* 
-	 * We ack quickly, we don't want the irq controller
-	 * thinking we're snobs just because some other CPU has
-	 * disabled global interrupts (we have already done the
-	 * INT_ACK cycles, it's too late to try to pretend to the
-	 * controller that we aren't taking the interrupt).
-	 *
-	 * 0 return value means that this irq is already being
-	 * handled by some other CPU. (or is disabled)
-	 */
-	int irq = regs.orig_eax & 0xff; /* high bits used in ret_from_ code  */
-	int cpu = smp_processor_id();
-	irq_desc_t *desc = irq_desc + irq;
-	struct irqaction * action;
-	unsigned int status;
+{
+    /*
+     * We ack quickly, we don't want the irq controller
+     * thinking we're snobs just because some other CPU has
+     * disabled global interrupts (we have already done the
+     * INT_ACK cycles, it's too late to try to pretend to the
+     * controller that we aren't taking the interrupt).
+     *
+     * 0 return value means that this irq is already being
+     * handled by some other CPU. (or is disabled)
+     */
+    // orig_eax：就是IRQxx_interrupt 压入栈的 nr-256，低8位取出irq号
+    int irq = regs.orig_eax & 0xff; /* high bits used in ret_from_ code  */
+    // 获取当前CPU编号，SMP多核使用
+    int cpu = smp_processor_id();
+    // irq_desc全局数组，每个irq对应一个irq_desc_t描述符
+    irq_desc_t *desc = irq_desc + irq;
+    struct irqaction * action;
+    unsigned int status;
 
-	kstat.irqs[cpu][irq]++;
-	spin_lock(&desc->lock);
-	desc->handler->ack(irq);
-	/*
-	   REPLAY is when Linux resends an IRQ that was dropped earlier
-	   WAITING is used by probe to mark irqs that are being tested
-	   */
-	status = desc->status & ~(IRQ_REPLAY | IRQ_WAITING);
-	status |= IRQ_PENDING; /* we _want_ to handle it */
+    // 统计：记录该CPU上这个IRQ触发次数
+    kstat.irqs[cpu][irq]++;
 
-	/*
-	 * If the IRQ is disabled for whatever reason, we cannot
-	 * use the action we have.
-	 */
-	action = NULL;
-	if (!(status & (IRQ_DISABLED | IRQ_INPROGRESS))) {
-		action = desc->action;
-		status &= ~IRQ_PENDING; /* we commit to handling */
-		status |= IRQ_INPROGRESS; /* we are handling it */
-	}
-	desc->status = status;
+    // 对该irq描述符加自旋锁，保护desc状态并发访问（SMP多核竞争）
+    spin_lock(&desc->lock);
 
-	/*
-	 * If there is no IRQ handler or it was disabled, exit early.
-	   Since we set PENDING, if another processor is handling
-	   a different instance of this same irq, the other processor
-	   will take care of it.
-	 */
-	if (!action)
-		goto out;
+    // 调用中断控制器的ack回调：应答硬件中断（PIC/IOAPIC ack）
+    desc->handler->ack(irq);
 
-	/*
-	 * Edge triggered interrupts need to remember
-	 * pending events.
-	 * This applies to any hw interrupts that allow a second
-	 * instance of the same irq to arrive while we are in do_IRQ
-	 * or in the handler. But the code here only handles the _second_
-	 * instance of the irq, not the third or fourth. So it is mostly
-	 * useful for irq hardware that does not mask cleanly in an
-	 * SMP environment.
-	 */
-	for (;;) {
-		spin_unlock(&desc->lock);
-		handle_IRQ_event(irq, &regs, action);
-		spin_lock(&desc->lock);
-		
-		if (!(desc->status & IRQ_PENDING))
-			break;
-		desc->status &= ~IRQ_PENDING;
-	}
-	desc->status &= ~IRQ_INPROGRESS;
+    /*
+       REPLAY is when Linux resends an IRQ that was dropped earlier
+       WAITING is used by probe to mark irqs that are being tested
+    */
+    // 清除IRQ_REPLAY、IRQ_WAITING标记，这两个标记本次不参与判断
+    status = desc->status & ~(IRQ_REPLAY | IRQ_WAITING);
+    // 置 IRQ_PENDING：标记有中断待处理
+    status |= IRQ_PENDING; /* we _want_ to handle it */
+
+    /*
+     * If the IRQ is disabled for whatever reason, we cannot
+     * use the action we have.
+     */
+    action = NULL;
+    // 条件：IRQ没有被禁用，并且当前不在处理中（IRQ_INPROGRESS）
+    if (!(status & (IRQ_DISABLED | IRQ_INPROGRESS))) {
+        // 取出驱动注册的中断处理链表头 irqaction
+        action = desc->action;
+        status &= ~IRQ_PENDING; /* we commit to handling，认领本次中断 */
+        status |= IRQ_INPROGRESS; /* 标记：正在处理该IRQ，防止多核并发处理同一个IRQ */
+    }
+    // 回写到irq描述符的status
+    desc->status = status;
+
+    /*
+     * If there is no IRQ handler or it was disabled, exit early.
+       Since we set PENDING, if another processor is handling
+       a different instance of this same irq, the other processor
+       will take care of it.
+     */
+    // 没有注册中断处理函数，或者IRQ被禁用，直接跳到out收尾
+    if (!action)
+        goto out;
+
+    /*
+     * Edge triggered interrupts need to remember
+     * pending events.
+     * This applies to any hw interrupts that allow a second
+     * instance of the same irq to arrive while we are in do_IRQ
+     * or in the handler. But the code here only handles the _second_
+     * instance of the irq, not the third or fourth. So it is mostly
+     * useful for irq hardware that does not mask cleanly in an
+     * SMP environment.
+     */
+    // 循环：专门处理边沿触发中断，处理中断期间再次来了同个IRQ的场景
+    for (;;) {
+        spin_unlock(&desc->lock);
+        // 核心：调用驱动注册的中断handler链表
+        handle_IRQ_event(irq, &regs, action);
+        spin_lock(&desc->lock);
+        
+        // 如果没有新的pending中断，退出循环
+        if (!(desc->status & IRQ_PENDING))
+            break;
+        // 清除pending标记，继续循环处理这次新来的中断
+        desc->status &= ~IRQ_PENDING;
+    }
+    // 清除正在处理标记，本次IRQ处理完成
+    desc->status &= ~IRQ_INPROGRESS;
+
 out:
-	/*
-	 * The ->end() handler has to deal with interrupts which got
-	 * disabled while the handler was running.
-	 */
-	desc->handler->end(irq);
-	spin_unlock(&desc->lock);
+    /*
+     * The ->end() handler has to deal with interrupts which got
+     * disabled while the handler was running.
+     */
+    // 调用中断控制器end回调，结束本次中断（根据硬件做掩码操作等）
+	// 通知 PIC，这个 IRQ 的服务已经结束，PIC 可以继续接收**同优先级 / 更低优先级**的中断
+    desc->handler->end(irq);
+    // 释放irq描述符自旋锁
+    spin_unlock(&desc->lock);
 
-	if (softirq_active(cpu) & softirq_mask(cpu))
-		do_softirq();
-	return 1;
+    // 检查是否有待执行软中断，如果有，执行do_softirq()
+	// do_softirq 的时候，仍然处在中断上下文，此时不能发生进程调度
+	// void schedule(void) 也会调用do_softirq，这个是**进程上下文**触发的软中断，这里跑软中断是允许调度的
+	// __softirq_mask 和 __softirq_mask 判断
+    if (softirq_active(cpu) & softirq_mask(cpu))
+        do_softirq();
+
+    return 1;
 }
 
 /**
@@ -658,52 +717,68 @@ out:
  *	SA_SAMPLE_RANDOM	The interrupt can be used for entropy
  *
  */
- 
-int request_irq(unsigned int irq, 
-		void (*handler)(int, void *, struct pt_regs *),
-		unsigned long irqflags, 
-		const char * devname,
-		void *dev_id)
+ /**
+ * int request_irq(unsigned int irq,
+ *                 void (*handler)(int, void *, struct pt_regs *),
+ *                 unsigned long irqflags,
+ *                 const char * devname,
+ *                 void *dev_id)
+ * Linux2.4 内核：驱动注册硬件中断服务函数的API
+ * @irq: 要申请的硬件中断号（IRQ编号）
+ * @handler: 驱动的中断服务程序ISR，中断触发后内核回调这个函数
+ * @irqflags: 中断标志位，SA_SHIRQ(共享中断) / SA_INTERRUPT(中断上下文关中断)等
+ * @devname: 设备名称，会展示在 /proc/interrupts
+ * @dev_id: 设备唯一标识，共享中断时用来区分是哪个设备触发中断；free_irq时必须传入
+ * 返回值：0成功；负数错误码(-EINVAL参数非法 / -ENOMEM内存不足)
+ * 调用位置：设备驱动，在probe阶段注册中断；对应释放接口 free_irq
+ */
+int request_irq(unsigned int irq,
+        void (*handler)(int, void *, struct pt_regs *),
+        unsigned long irqflags,
+        const char * devname,
+        void *dev_id)
 {
-	int retval;
-	struct irqaction * action;
-
+    int retval;
+    struct irqaction * action;
 #if 1
-	/*
-	 * Sanity-check: shared interrupts should REALLY pass in
-	 * a real dev-ID, otherwise we'll have trouble later trying
-	 * to figure out which interrupt is which (messes up the
-	 * interrupt freeing logic etc).
-	 */
-	if (irqflags & SA_SHIRQ) {
-		if (!dev_id)
-			printk("Bad boy: %s (at 0x%x) called us without a dev_id!\n", devname, (&irq)[-1]);
-	}
+    /*
+     * Sanity-check: shared interrupts should REALLY pass in
+     * a real dev-ID, otherwise we'll have trouble later trying
+     * to figure out which interrupt is which (messes up the
+     * interrupt freeing logic etc).
+     */
+    // 安全检查：如果是共享中断SA_SHIRQ，dev_id不能为NULL
+    // 共享中断：多个设备共用同一个IRQ号，靠dev_id区分，free_irq也要用dev_id匹配
+    if (irqflags & SA_SHIRQ) {
+        if (!dev_id)
+            printk("Bad boy: %s (at 0x%x) called us without a dev_id!\n", devname, (&irq)[-1]);
+    }
 #endif
-
-	if (irq >= NR_IRQS)
-		return -EINVAL;
-	if (!handler)
-		return -EINVAL;
-
-	action = (struct irqaction *)
-			kmalloc(sizeof(struct irqaction), GFP_KERNEL);
-	if (!action)
-		return -ENOMEM;
-
-	action->handler = handler;
-	action->flags = irqflags;
-	action->mask = 0;
-	action->name = devname;
-	action->next = NULL;
-	action->dev_id = dev_id;
-
-	retval = setup_irq(irq, action);
-	if (retval)
-		kfree(action);
-	return retval;
+    // 校验IRQ号是否越界
+    if (irq >= NR_IRQS)
+        return -EINVAL;
+    // 中断处理函数不能为空
+    if (!handler)
+        return -EINVAL;
+    // 分配irqaction结构体，GFP_KERNEL：允许睡眠分配内存
+    action = (struct irqaction *)
+            kmalloc(sizeof(struct irqaction), GFP_KERNEL);
+    if (!action)
+        return -ENOMEM;
+    // 填充irqaction结构体：保存驱动中断处理函数、标志、设备名、dev_id
+    action->handler = handler;
+    action->flags = irqflags;
+    action->mask = 0;
+    action->name = devname;
+    action->next = NULL;
+    action->dev_id = dev_id;
+    // 核心函数：把action挂载到irq_desc的action链表上，完成注册
+    retval = setup_irq(irq, action);
+    // 注册失败，释放刚才分配的irqaction内存，防止内存泄漏
+    if (retval)
+        kfree(action);
+    return retval;
 }
-
 /**
  *	free_irq - free an interrupt
  *	@irq: Interrupt line to free
@@ -721,47 +796,53 @@ int request_irq(unsigned int irq,
  *	Bugs: Attempting to free an irq in a handler for the same irq hangs
  *	      the machine.
  */
- 
+// Linux2.4 释放中断函数，和request_irq/setup_irq成对使用，卸载驱动时注销中断
+// irq：中断号；dev_id：注册中断时传入的设备id，用来定位要删除的irqaction节点
 void free_irq(unsigned int irq, void *dev_id)
 {
-	irq_desc_t *desc;
-	struct irqaction **p;
-	unsigned long flags;
-
-	if (irq >= NR_IRQS)
-		return;
-
-	desc = irq_desc + irq;
-	spin_lock_irqsave(&desc->lock,flags);
-	p = &desc->action;
-	for (;;) {
-		struct irqaction * action = *p;
-		if (action) {
-			struct irqaction **pp = p;
-			p = &action->next;
-			if (action->dev_id != dev_id)
-				continue;
-
-			/* Found it - now remove it from the list of entries */
-			*pp = action->next;
-			if (!desc->action) {
-				desc->status |= IRQ_DISABLED;
-				desc->handler->shutdown(irq);
-			}
-			spin_unlock_irqrestore(&desc->lock,flags);
-
+    irq_desc_t *desc;
+    struct irqaction **p;
+    unsigned long flags;
+    // 合法性检查：中断号超出最大支持范围直接返回
+    if (irq >= NR_IRQS)
+        return;
+    // 获取对应中断号的irq_desc描述符
+    desc = irq_desc + irq;
+    // 加自旋锁+保存中断状态，原子操作保护irqaction链表
+    spin_lock_irqsave(&desc->lock,flags);
+    // p是二级指针，遍历链表用
+    p = &desc->action;
+    for (;;) {
+        struct irqaction * action = *p;
+        if (action) {
+            struct irqaction **pp = p;
+            p = &action->next;
+            // 根据dev_id匹配节点，共享中断必须依靠dev_id区分不同设备
+            if (action->dev_id != dev_id)
+                continue;
+            // 找到目标节点，将节点从单向链表摘除
+            *pp = action->next;
+            // 如果摘除后链表为空（没有其他设备共享该IRQ）
+            if (!desc->action) {
+                desc->status |= IRQ_DISABLED; // 标记IRQ为禁用
+                desc->handler->shutdown(irq); // 调用硬件控制器shutdown，关闭硬件中断
+            }
+            // 释放自旋锁，恢复中断标志
+            spin_unlock_irqrestore(&desc->lock,flags);
 #ifdef CONFIG_SMP
-			/* Wait to make sure it's not being used on another CPU */
-			while (desc->status & IRQ_INPROGRESS)
-				barrier();
+            // SMP多核场景：等待，确保其他CPU上正在执行的中断handler执行完毕
+            while (desc->status & IRQ_INPROGRESS)
+                barrier();
 #endif
-			kfree(action);
-			return;
-		}
-		printk("Trying to free free IRQ%d\n",irq);
-		spin_unlock_irqrestore(&desc->lock,flags);
-		return;
-	}
+            // 释放irqaction结构体内存
+            kfree(action);
+            return;
+        }
+        // 链表为空，说明重复释放，打印警告
+        printk("Trying to free free IRQ%d\n",irq);
+        spin_unlock_irqrestore(&desc->lock,flags);
+        return;
+    }
 }
 
 /*
@@ -956,11 +1037,15 @@ int probe_irq_off(unsigned long val)
 }
 
 /* this was setup_x86_irq but it seems pretty generic */
+// Linux2.4 底层注册中断action的核心函数，request_irq内部会调用setup_irq
+// irq：要注册的中断号；new：待插入的irqaction节点
 int setup_irq(unsigned int irq, struct irqaction * new)
 {
 	int shared = 0;
 	unsigned long flags;
 	struct irqaction *old, **p;
+
+	//中断的描述信息
 	irq_desc_t *desc = irq_desc + irq;
 
 	/*
@@ -968,6 +1053,8 @@ int setup_irq(unsigned int irq, struct irqaction * new)
 	 * so we have to be careful not to interfere with a
 	 * running system.
 	 */
+	// 如果新action带有SA_SAMPLE_RANDOM标记，初始化该irq的随机熵采集
+    // rand_initialize_irq可能睡眠，必须放到自旋锁外面执行
 	if (new->flags & SA_SAMPLE_RANDOM) {
 		/*
 		 * This function might sleep, we want to call it first,
@@ -985,14 +1072,19 @@ int setup_irq(unsigned int irq, struct irqaction * new)
 	 */
 	spin_lock_irqsave(&desc->lock,flags);
 	p = &desc->action;
+
+	// 判断当前irq是否已经存在action（已有中断处理函数）
 	if ((old = *p) != NULL) {
 		/* Can't share interrupts unless both agree to */
+		// 已有handler，检查是否双方都开启SA_SHIRQ共享标记
+        // 老节点 和 新节点必须同时带有SA_SHIRQ，才允许共享IRQ
 		if (!(old->flags & new->flags & SA_SHIRQ)) {
 			spin_unlock_irqrestore(&desc->lock,flags);
 			return -EBUSY;
 		}
 
 		/* add new interrupt at end of irq queue */
+		// 共享中断场景：遍历到链表尾部，新节点追加到链表末尾
 		do {
 			p = &old->next;
 			old = *p;
@@ -1002,13 +1094,17 @@ int setup_irq(unsigned int irq, struct irqaction * new)
 
 	*p = new;
 
-	if (!shared) {
-		desc->depth = 0;
-		desc->status &= ~(IRQ_DISABLED | IRQ_AUTODETECT | IRQ_WAITING);
-		desc->handler->startup(irq);
-	}
+	// 如果不是共享中断（链表之前为空，第一次注册）
+    if (!shared) {
+        desc->depth = 0; // 清空中断禁用嵌套计数
+        // 清除IRQ禁用、自动探测、等待标记
+        desc->status &= ~(IRQ_DISABLED | IRQ_AUTODETECT | IRQ_WAITING);
+        // 调用硬件控制器startup回调，使能硬件IRQ
+        desc->handler->startup(irq);
+    }
 	spin_unlock_irqrestore(&desc->lock,flags);
 
+	//为当前中断注册proc函数
 	register_irq_proc(irq);
 	return 0;
 }
@@ -1118,30 +1214,34 @@ static int prof_cpu_mask_write_proc (struct file *file, const char *buffer,
 
 #define MAX_NAMELEN 10
 
+// Linux2.4 创建 /proc/irq/<irq号> 目录以及 smp_affinity 文件
 static void register_irq_proc (unsigned int irq)
 {
-	struct proc_dir_entry *entry;
-	char name [MAX_NAMELEN];
-
-	if (!root_irq_dir || (irq_desc[irq].handler == &no_irq_type) ||
-			irq_dir[irq])
-		return;
-
-	memset(name, 0, MAX_NAMELEN);
-	sprintf(name, "%d", irq);
-
-	/* create /proc/irq/1234 */
-	irq_dir[irq] = proc_mkdir(name, root_irq_dir);
-
-	/* create /proc/irq/1234/smp_affinity */
-	entry = create_proc_entry("smp_affinity", 0600, irq_dir[irq]);
-
-	entry->nlink = 1;
-	entry->data = (void *)(long)irq;
-	entry->read_proc = irq_affinity_read_proc;
-	entry->write_proc = irq_affinity_write_proc;
-
-	smp_affinity_entry[irq] = entry;
+    struct proc_dir_entry *entry;
+    char name [MAX_NAMELEN];
+    // 条件判断：
+    // root_irq_dir：/proc/irq 根目录是否存在
+    // handler == &no_irq_type：该irq没有有效的中断控制器
+    // irq_dir[irq] != NULL：已经创建过该irq的proc目录，避免重复创建
+    if (!root_irq_dir || (irq_desc[irq].handler == &no_irq_type) ||
+            irq_dir[irq])
+        return;
+    memset(name, 0, MAX_NAMELEN);
+    sprintf(name, "%d", irq);
+    /* create /proc/irq/1234 */
+    // 创建 /proc/irq/irq号 目录
+    irq_dir[irq] = proc_mkdir(name, root_irq_dir);
+    /* create /proc/irq/1234/smp_affinity */
+    // 在上面目录里创建 smp_affinity 文件，权限0600，仅root读写
+    entry = create_proc_entry("smp_affinity", 0600, irq_dir[irq]);
+    entry->nlink = 1;
+    // 私有data存irq编号，read/write回调里面拿到这个irq
+    entry->data = (void *)(long)irq;
+    // 绑定读写回调：读取、修改中断CPU亲和掩码
+    entry->read_proc = irq_affinity_read_proc;
+    entry->write_proc = irq_affinity_write_proc;
+    // 保存entry指针，后续可以使用
+    smp_affinity_entry[irq] = entry;
 }
 
 unsigned long prof_cpu_mask = -1;

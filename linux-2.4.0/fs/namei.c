@@ -166,36 +166,69 @@ char * getname(const char * filename)
  * for filesystem access without changing the "normal" uids which
  * are used for other things..
  */
+/**
+ * vfs_permission - VFS 默认权限校验实现（Linux2.4）
+ * @inode: 待检查文件的inode
+ * @mask: 需要检查的权限掩码（MAY_READ/MAY_WRITE/MAY_EXEC，底层映射为 S_IRUSR/S_IWUSR/S_IXUSR 这类）
+ *
+ * 上层permission()函数在文件系统没有自定义i_op->permission时，调用此默认函数。
+ * 实现标准UNIX rwx权限检查，同时处理只读文件系统、不可变属性、root能力(capabilities)。
+ */
 int vfs_permission(struct inode * inode,int mask)
 {
 	int mode = inode->i_mode;
 
+	//复用 #define MAY_WRITE 2， 这个代码怪模怪样
+	// 1. 写权限检查：如果请求写 && 文件系统只读，且是普通文件/目录/软链接 → 返回只读错误
 	if ((mask & S_IWOTH) && IS_RDONLY(inode) &&
 		 (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
 		return -EROFS; /* Nobody gets write access to a read-only fs */
 
+	// 2. 文件设置了IMMUTABLE(不可变)属性，任何人都不能写
 	if ((mask & S_IWOTH) && IS_IMMUTABLE(inode))
 		return -EACCES; /* Nobody gets write access to an immutable file */
 
+	// 3. 权限位移位：判断当前进程fsuid是文件属主，就右移6bit（取出owner rwx）
+	//    如果属于文件所属用户组，右移3bit（取出group rwx）
+	//    否则不动，直接看other位
 	if (current->fsuid == inode->i_uid)
-		mode >>= 6;
+		mode >>= 6;  //用户权限
 	else if (in_group_p(inode->i_gid))
-		mode >>= 3;
+		mode >>= 3;  //组权限
 
+	// 4. 检查：权限位满足要求，或者拥有 CAP_DAC_OVERRIDE 能力（绕过DAC权限检查）
+	//    CAP_DAC_OVERRIDE：root常用能力，可以无视rwx读写执行权限
 	if (((mode & mask & S_IRWXO) == mask) || capable(CAP_DAC_OVERRIDE))
 		return 0;
 
 	/* read and search access */
+	// 5. 特殊能力 CAP_DAC_READ_SEARCH：仅允许绕过【读】和【目录检索】权限
+	//    不能用来写文件。
+	// #define MAY_READ 4
 	if ((mask == S_IROTH) ||
 	    (S_ISDIR(inode->i_mode)  && !(mask & ~(S_IROTH | S_IXOTH))))
 		if (capable(CAP_DAC_READ_SEARCH))
 			return 0;
 
+	// 全部校验失败：权限拒绝
 	return -EACCES;
 }
 
+/**
+ * permission - VFS权限检查入口函数（Linux 2.4内核）
+ * @inode: 待校验的文件对应的inode对象
+ * @mask: 要检查的权限掩码：MAY_READ / MAY_WRITE / MAY_EXEC
+ *
+ * 调用路径：path_walk -> permission，open_namei也会调用它
+ * 作用：判断当前进程是否拥有对该inode的读/写/执行权限
+ * 逻辑：优先使用文件系统自定义的permission回调；没有自定义回调，走通用vfs_permission
+ * #define MAY_EXEC 1
+ * #define MAY_WRITE 2
+ * #define MAY_READ 4
+ */
 int permission(struct inode * inode,int mask)
 {
+	// 如果inode的i_op存在，并且i_op提供了permission回调函数
 	if (inode->i_op && inode->i_op->permission) {
 		int retval;
 		lock_kernel();
@@ -203,6 +236,7 @@ int permission(struct inode * inode,int mask)
 		unlock_kernel();
 		return retval;
 	}
+	// 文件系统没有实现自定义permission方法，使用VFS默认权限检查函数
 	return vfs_permission(inode, mask);
 }
 
@@ -850,13 +884,22 @@ int path_init(const char *name, unsigned int flags, struct nameidata *nd)
  * needs parent already locked. Doesn't follow mounts.
  * SMP-safe.
  */
+/**
+ * lookup_hash - 在父目录下，按名字qstr查找dentry（dcache + 文件系统lookup回调），如果没有就创建一下空的dentry
+ * @name: 待查找名字（qstr：字符串+长度，避免'\0'依赖）
+ * @base: 父目录的dentry
+ *
+ * 返回：合法dentry指针 或者 ERR_PTR(错误码)
+ */
 struct dentry * lookup_hash(struct qstr *name, struct dentry * base)
 {
 	struct dentry * dentry;
 	struct inode *inode;
 	int err;
 
+	// base是父目录dentry，取出父目录inode
 	inode = base->d_inode;
+	// 权限检查：目录需要MAY_EXEC（遍历/搜索权限）
 	err = permission(inode, MAY_EXEC);
 	dentry = ERR_PTR(err);
 	if (err)
@@ -865,6 +908,8 @@ struct dentry * lookup_hash(struct qstr *name, struct dentry * base)
 	/*
 	 * See if the low-level filesystem might want
 	 * to use its own hash..
+	 * 如果dentry操作集提供d_hash回调，交给文件系统自定义hash计算
+	 * 部分文件系统需要特殊hash规则（如不区分大小写）
 	 */
 	if (base->d_op && base->d_op->d_hash) {
 		err = base->d_op->d_hash(base, name);
@@ -873,15 +918,26 @@ struct dentry * lookup_hash(struct qstr *name, struct dentry * base)
 			goto out;
 	}
 
+	// 第一步：优先查dcache缓存，cached_lookup在dentry哈希表找这个名字
 	dentry = cached_lookup(base, name, 0);
 	if (!dentry) {
+		// dcache没有命中，分配一个全新空白dentry，挂载到父目录base下
 		struct dentry *new = d_alloc(base, name);
 		dentry = ERR_PTR(-ENOMEM);
 		if (!new)
 			goto out;
+
 		lock_kernel();
+		// 调用文件系统层lookup回调（ext2_lookup等），去磁盘上查找这个名字对应的inode
+		// 参数new：刚分配好的空白dentry，供文件系统填充
 		dentry = inode->i_op->lookup(inode, new);
 		unlock_kernel();
+
+		/*
+		 * 文件系统lookup返回逻辑：
+		 * 返回NULL：磁盘上找不到这个名字 → new保留，返回这个dentry（d_inode=NULL，空dentry）
+		 * 返回有效dentry：磁盘找到，返回已经绑定inode的dentry，释放刚才分配的new
+		 */
 		if (!dentry)
 			dentry = new;
 		else
@@ -1009,12 +1065,26 @@ static inline int may_delete(struct inode *dir,struct dentry *victim, int isdir)
  *  3. We should have write and exec permissions on dir
  *  4. We can't do it if dir is immutable (done in permission())
  */
+/**
+ * may_create - 检查是否允许在dir目录下新建子项
+ * @dir: 父目录inode
+ * @child: 待新建项对应的dentry
+ *
+ * 返回值：0 允许创建；负数错误码不允许
+ */
 static inline int may_create(struct inode *dir, struct dentry *child) {
-	if (child->d_inode)
-		return -EEXIST;
-	if (IS_DEADDIR(dir))
-		return -ENOENT;
-	return permission(dir,MAY_WRITE | MAY_EXEC);
+    // 如果这个dentry已经绑定inode，代表文件/目录已存在，返回文件已存在
+    if (child->d_inode)
+        return -EEXIST;
+
+    // 父目录已经被标记为删除（死目录），不允许新建，返回文件不存在
+    if (IS_DEADDIR(dir))
+        return -ENOENT;
+
+    // 权限校验：目录需要【写权限】+【执行权限】
+    // MAY_WRITE：允许在目录里增删条目
+    // MAY_EXEC：允许遍历目录（搜索，找到里面的条目）
+    return permission(dir, MAY_WRITE | MAY_EXEC);
 }
 
 /* 
@@ -1039,31 +1109,56 @@ static inline int lookup_flags(unsigned int f)
 	return retval;
 }
 
+/**
+ * vfs_create - VFS层，创建普通文件
+ * @dir: 父目录inode
+ * @dentry: 待创建文件对应的dentry（已经lookup_create查到、确认不存在）
+ * @mode: 用户传入的文件权限
+ *
+ * 作用：VFS通用创建普通文件入口，对应open(O_CREAT)创建常规文件
+ * 注意：只创建S_IFREG普通文件；目录、符号链接、FIFO、设备节点不走这个函数
+ *       目录用vfs_mkdir，FIFO/字符设备/块设备用vfs_mknod，软链接vfs_symlink
+ */
 int vfs_create(struct inode *dir, struct dentry *dentry, int mode)
 {
-	int error;
+    int error;
 
-	mode &= S_IALLUGO & ~current->fs->umask;
-	mode |= S_IFREG;
+    // mode过滤：先去掉用户umask屏蔽的权限位
+    mode &= S_IALLUGO & ~current->fs->umask;
+    // 强制设置文件类型为普通文件 S_IFREG
+    mode |= S_IFREG;
 
-	down(&dir->i_zombie);
-	error = may_create(dir, dentry);
-	if (error)
-		goto exit_lock;
+    // 获取父目录i_zombie信号量，保护目录inode操作
+    down(&dir->i_zombie);
 
-	error = -EACCES;	/* shouldn't it be ENOSYS? */
-	if (!dir->i_op || !dir->i_op->create)
-		goto exit_lock;
+    // 权限检查：判断是否允许在该目录下创建文件
+    error = may_create(dir, dentry);
+    if (error)
+        goto exit_lock;
 
-	DQUOT_INIT(dir);
-	lock_kernel();
-	error = dir->i_op->create(dir, dentry, mode);
-	unlock_kernel();
+    error = -EACCES;    /* shouldn't it be ENOSYS? */
+    // 检查父目录inode操作向量表是否实现create回调
+    if (!dir->i_op || !dir->i_op->create)
+        goto exit_lock;
+
+    // 配额初始化（磁盘配额相关）
+    DQUOT_INIT(dir);
+
+    // 全局内核大锁，2.4内核BKL
+    lock_kernel();
+    // 调用具体文件系统的create回调（ext2_create等），真正在磁盘建立inode
+    error = dir->i_op->create(dir, dentry, mode);
+    unlock_kernel();
+
 exit_lock:
-	up(&dir->i_zombie);
-	if (!error)
-		inode_dir_notify(dir, DN_CREATE);
-	return error;
+    // 释放父目录信号量
+    up(&dir->i_zombie);
+
+    // 创建成功，发送目录变更通知（DN_CREATE）给监听进程
+    if (!error)
+        inode_dir_notify(dir, DN_CREATE);
+
+    return error;
 }
 
 /*
@@ -1315,97 +1410,162 @@ do_link:
 }
 
 /* SMP-safe */
+/**
+ * lookup_create - 在父目录中查找待新建文件的dentry，检查是否允许创建（Linux2.4）
+ * @nd: 路径查找上下文nameidata，包含父目录、本次要查找的名字
+ * @is_dir: 是否要创建目录，1代表创建目录，0代表普通文件/FIFO/设备等
+ * 返回值：成功返回dentry；失败返回ERR_PTR负错误码
+ */
 static struct dentry *lookup_create(struct nameidata *nd, int is_dir)
 {
-	struct dentry *dentry;
-
-	down(&nd->dentry->d_inode->i_sem);
-	dentry = ERR_PTR(-EEXIST);
-	if (nd->last_type != LAST_NORM)
-		goto fail;
-	dentry = lookup_hash(&nd->last, nd->dentry);
-	if (IS_ERR(dentry))
-		goto fail;
-	if (!is_dir && nd->last.name[nd->last.len] && !dentry->d_inode)
-		goto enoent;
-	return dentry;
+    struct dentry *dentry;
+    // 拿父目录inode的i_sem信号量，串行目录的查找、创建操作，防止并发创建
+    down(&nd->dentry->d_inode->i_sem);
+    // 默认初始化为文件已存在错误-EEXIST
+    dentry = ERR_PTR(-EEXIST);
+    // LAST_NORM：正常文件名；如果last_type不是LAST_NORM（比如. .. /等特殊项），直接失败
+    if (nd->last_type != LAST_NORM)
+        goto fail;
+    // 在父目录dentry下，根据名字哈希查找dentry（dcache缓存查找）
+	// 在里面缓存没有，会直接创建一个空的dentry
+    dentry = lookup_hash(&nd->last, nd->dentry);
+    if (IS_ERR(dentry))
+        goto fail;
+    /*
+     * is_dir=0：创建非目录（普通文件、fifo、设备）
+     * nd->last.name[nd->last.len] 这个判断是老2.4路径边界判断
+     * !dentry->d_inode：查到的dentry在dcache里，但没有绑定inode（negative dentry，负目录项）
+     * 满足条件 → 目标名字目前不存在，可以新建，返回-ENOENT分支
+     */
+    if (!is_dir && nd->last.name[nd->last.len] && !dentry->d_inode)
+        goto enoent;
+    // 走到这里：dentry存在并且挂载了inode → 文件已存在，返回-EEXIST
+    return dentry;
 enoent:
-	dput(dentry);
-	dentry = ERR_PTR(-ENOENT);
+    // 负目录项，不需要保留这个dentry引用，释放
+    dput(dentry);
+    // 返回错误码-ENOENT，上层知道：名字不存在，可以创建
+    dentry = ERR_PTR(-ENOENT);
 fail:
-	return dentry;
+    return dentry;
 }
 
+/**
+ * vfs_mknod - VFS层通用mknod函数，创建设备文件/FIFO/socket（Linux2.4）
+ * @dir: 父目录inode
+ * @dentry: 待新建文件对应的目录项
+ * @mode: 文件类型+权限
+ * @dev: 设备号，FIFO填0
+ * 返回值：0成功，负数错误码
+ */
 int vfs_mknod(struct inode *dir, struct dentry *dentry, int mode, dev_t dev)
 {
-	int error = -EPERM;
+    int error = -EPERM;
+    // 应用当前进程的umask，屏蔽掉不需要的权限位
+    mode &= ~current->fs->umask;
+    // 父目录i_zombie信号量，保护inode销毁/目录创建竞争
+    down(&dir->i_zombie);
 
-	mode &= ~current->fs->umask;
+    // 如果是字符设备/块设备，需要CAP_MKNOD权限；FIFO/SOCK不需要这个cap
+    if ((S_ISCHR(mode) || S_ISBLK(mode)) && !capable(CAP_MKNOD))
+        goto exit_lock;
 
-	down(&dir->i_zombie);
-	if ((S_ISCHR(mode) || S_ISBLK(mode)) && !capable(CAP_MKNOD))
-		goto exit_lock;
+    // 检查：父目录是否允许在此目录下创建文件（权限、粘滞位等）
+    error = may_create(dir, dentry);
+    if (error)
+        goto exit_lock;
 
-	error = may_create(dir, dentry);
-	if (error)
-		goto exit_lock;
+    error = -EPERM;
+    // 父目录inode操作集必须提供mknod回调，否则该文件系统不支持创建这类特殊文件
+    if (!dir->i_op || !dir->i_op->mknod)
+        goto exit_lock;
 
-	error = -EPERM;
-	if (!dir->i_op || !dir->i_op->mknod)
-		goto exit_lock;
+    // 初始化磁盘配额
+    DQUOT_INIT(dir);
+    // 2.4大内核锁BKL，串行文件系统内部操作
+    lock_kernel();
+    // 调用具体文件系统的mknod回调（ext2_mknod等），分配inode
+    unlock_kernel();
+    error = dir->i_op->mknod(dir, dentry, mode, dev);
 
-	DQUOT_INIT(dir);
-	lock_kernel();
-	error = dir->i_op->mknod(dir, dentry, mode, dev);
-	unlock_kernel();
 exit_lock:
-	up(&dir->i_zombie);
-	if (!error)
-		inode_dir_notify(dir, DN_CREATE);
-	return error;
+    // 释放i_zombie信号量
+    up(&dir->i_zombie);
+    // 创建成功，发送目录事件通知DN_CREATE（inotify前身）
+    if (!error)
+        inode_dir_notify(dir, DN_CREATE);
+    return error;
 }
 
+/**
+ * sys_mknod - mknod系统调用入口 (Linux2.4)
+ * @filename: 用户态传入的文件路径
+ * @mode: 文件类型 + 权限位
+ * @dev: 设备号，字符/块设备使用，FIFO、socket填0
+ * 返回值：成功返回0，失败返回负的错误码
+ * 
+ * mknod 文件名      c 主设备号 次设备号
+ * mknod /dev/mychr c  240      0  =  sys_mknod("/dev/mychr", S_IFCHR | 0666, MKDEV(240, 0));
+ * #define MKDEV(ma,mi) (((ma) << 8) | (mi))  用户层的定义
+ */
 asmlinkage long sys_mknod(const char * filename, int mode, dev_t dev)
 {
-	int error = 0;
-	char * tmp;
-	struct dentry * dentry;
-	struct nameidata nd;
+    int error = 0;
+    char * tmp;
+    struct dentry * dentry;
+    struct nameidata nd;
 
-	if (S_ISDIR(mode))
-		return -EPERM;
-	tmp = getname(filename);
-	if (IS_ERR(tmp))
-		return PTR_ERR(tmp);
+    // 如果mode指定是目录，直接返回-EPERM，目录要用sys_mkdir，不走这里
+    if (S_ISDIR(mode))
+        return -EPERM;
 
-	if (path_init(tmp, LOOKUP_PARENT, &nd))
-		error = path_walk(tmp, &nd);
-	if (error)
-		goto out;
-	dentry = lookup_create(&nd, 0);
-	error = PTR_ERR(dentry);
-	if (!IS_ERR(dentry)) {
-		switch (mode & S_IFMT) {
-		case 0: case S_IFREG:
-			error = vfs_create(nd.dentry->d_inode,dentry,mode);
-			break;
-		case S_IFCHR: case S_IFBLK: case S_IFIFO: case S_IFSOCK:
-			error = vfs_mknod(nd.dentry->d_inode,dentry,mode,dev);
-			break;
-		case S_IFDIR:
-			error = -EPERM;
-			break;
-		default:
-			error = -EINVAL;
-		}
-		dput(dentry);
-	}
-	up(&nd.dentry->d_inode->i_sem);
-	path_release(&nd);
+    // 把用户空间的路径字符串拷贝到内核缓冲区tmp
+    tmp = getname(filename);
+    // 判断getname是否出错（比如地址非法）
+    if (IS_ERR(tmp))
+        return PTR_ERR(tmp);
+
+    // 初始化nameidata查找上下文，LOOKUP_PARENT：查找父目录
+    if (path_init(tmp, LOOKUP_PARENT, &nd))
+        // 路径解析，找到父目录的dentry、inode，结果保存在nd
+        error = path_walk(tmp, &nd);
+    if (error)
+        goto out;
+
+    // 在父目录下，查找并创建待新建文件的dentry；参数0代表不需要创建目录
+    dentry = lookup_create(&nd, 0);
+    error = PTR_ERR(dentry);
+    if (!IS_ERR(dentry)) {
+        // 取出mode中的文件类型掩码，分支处理
+        switch (mode & S_IFMT) {
+        // mode没有指定类型 或者 普通文件
+        case 0: case S_IFREG:
+            // 创建普通文件，调用vfs_create
+            error = vfs_create(nd.dentry->d_inode,dentry,mode);
+            break;
+        // 字符设备、块设备、FIFO有名管道、socket文件，走vfs_mknod
+        case S_IFCHR: case S_IFBLK: case S_IFIFO: case S_IFSOCK:
+            error = vfs_mknod(nd.dentry->d_inode,dentry,mode,dev);
+            break;
+        // 目录类型，再次拦截返回无权限
+        case S_IFDIR:
+            error = -EPERM;
+            break;
+        // 不识别的文件类型，参数无效
+        default:
+            error = -EINVAL;
+        }
+        // 释放本次新建项dentry引用计数
+        dput(dentry);
+    }
+    // 释放父目录inode的信号量i_sem（path_walk拿到的读写保护信号量）
+    up(&nd.dentry->d_inode->i_sem);
+    // 释放nameidata查找上下文，释放沿途dentry引用
+    path_release(&nd);
 out:
-	putname(tmp);
-
-	return error;
+    // 释放getname分配的内核路径缓冲区
+    putname(tmp);
+    return error;
 }
 
 int vfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)

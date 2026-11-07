@@ -381,71 +381,91 @@ int timer_ack;
  * timer_interrupt() needs to keep up the real-time clock,
  * as well as call the "do_timer()" routine every clocktick
  */
+/**
+ * do_timer_interrupt - 定时器中断核心处理函数
+ * @irq: 中断号
+ * @dev_id: 设备私有数据
+ * @regs: 中断现场寄存器
+ *
+ * 功能：IOAPIC/VISWS/MCA等平台做硬件ack；调用do_timer完成节拍更新；采样profile性能统计；
+ *       满足条件时把内核xtime同步写回CMOS RTC
+ * 约束：硬中断上下文，由timer_interrupt上半部调用，持有xtime_lock
+ * 上下文：硬中断上下文
+ */
 static inline void do_timer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
 #ifdef CONFIG_X86_IO_APIC
-	if (timer_ack) {
-		/*
-		 * Subtle, when I/O APICs are used we have to ack timer IRQ
-		 * manually to reset the IRR bit for do_slow_gettimeoffset().
-		 * This will also deassert NMI lines for the watchdog if run
-		 * on an 82489DX-based system.
-		 */
-		spin_lock(&i8259A_lock);
-		outb(0x0c, 0x20);
-		/* Ack the IRQ; AEOI will end it automatically. */
-		inb(0x20);
-		spin_unlock(&i8259A_lock);
-	}
+    if (timer_ack) {
+        /*
+         * Subtle, when I/O APICs are used we have to ack timer IRQ
+         * manually to reset the IRR bit for do_slow_gettimeoffset().
+         * This will also deassert NMI lines for the watchdog if run
+         * on an 82489DX-based system.
+         */
+        // 获取8259A PIC锁，保护PIC端口操作
+        spin_lock(&i8259A_lock);
+        // 向主PIC 0x20端口发送0x0c，特殊的EOI应答
+        outb(0x0c, 0x20);
+        // 读OCW3，完成ack流程
+        inb(0x20);
+        // 释放PIC锁
+        spin_unlock(&i8259A_lock);
+    }
 #endif
-
 #ifdef CONFIG_VISWS
-	/* Clear the interrupt */
-	co_cpu_write(CO_CPU_STAT,co_cpu_read(CO_CPU_STAT) & ~CO_STAT_TIMEINTR);
+    /* Clear the interrupt */
+    // Cobalt平台，清除定时器中断状态位
+    co_cpu_write(CO_CPU_STAT,co_cpu_read(CO_CPU_STAT) & ~CO_STAT_TIMEINTR);
 #endif
-	do_timer(regs);
+    // 最核心：jiffies++、更新xtime、触发timer_bh下半部处理内核定时器
+    do_timer(regs);
 /*
  * In the SMP case we use the local APIC timer interrupt to do the
  * profiling, except when we simulate SMP mode on a uniprocessor
  * system, in that case we have to call the local interrupt handler.
  */
 #ifndef CONFIG_X86_LOCAL_APIC
-	if (!user_mode(regs))
-		x86_do_profile(regs->eip);
+    // 没有本地APIC：内核态触发性能采样profile，记录PC（eip）
+    if (!user_mode(regs))
+        x86_do_profile(regs->eip);
 #else
-	if (!smp_found_config)
-		smp_local_timer_interrupt(regs);
+    // 有APIC但未找到SMP配置，调用本地定时器profile函数
+    if (!smp_found_config)
+        smp_local_timer_interrupt(regs);
 #endif
-
-	/*
-	 * If we have an externally synchronized Linux clock, then update
-	 * CMOS clock accordingly every ~11 minutes. Set_rtc_mmss() has to be
-	 * called as close as possible to 500 ms before the new second starts.
-	 */
-	if ((time_status & STA_UNSYNC) == 0 &&
-	    xtime.tv_sec > last_rtc_update + 660 &&
-	    xtime.tv_usec >= 500000 - ((unsigned) tick) / 2 &&
-	    xtime.tv_usec <= 500000 + ((unsigned) tick) / 2) {
-		if (set_rtc_mmss(xtime.tv_sec) == 0)
-			last_rtc_update = xtime.tv_sec;
-		else
-			last_rtc_update = xtime.tv_sec - 600; /* do it again in 60 s */
-	}
-	    
+    /*
+     * If we have an externally synchronized Linux clock, then update
+     * CMOS clock accordingly every ~11 minutes. Set_rtc_mmss() has to be
+     * called as close as possible to 500 ms before the new second starts.
+     */
+    // 时钟已同步、距离上次写RTC超过660秒、时间落在半秒附近，同步xtime到CMOS RTC
+    if ((time_status & STA_UNSYNC) == 0 &&
+        xtime.tv_sec > last_rtc_update + 660 &&
+        xtime.tv_usec >= 500000 - ((unsigned) tick) / 2 &&
+        xtime.tv_usec <= 500000 + ((unsigned) tick) / 2) {
+        // 写入RTC成功，更新上次写入时间
+        if (set_rtc_mmss(xtime.tv_sec) == 0)
+            last_rtc_update = xtime.tv_sec;
+        else
+            // 写入失败，60秒后重试
+            last_rtc_update = xtime.tv_sec - 600; /* do it again in 60 s */
+    }
+            
 #ifdef CONFIG_MCA
-	if( MCA_bus ) {
-		/* The PS/2 uses level-triggered interrupts.  You can't
-		turn them off, nor would you want to (any attempt to
-		enable edge-triggered interrupts usually gets intercepted by a
-		special hardware circuit).  Hence we have to acknowledge
-		the timer interrupt.  Through some incredibly stupid
-		design idea, the reset for IRQ 0 is done by setting the
-		high bit of the PPI port B (0x61).  Note that some PS/2s,
-		notably the 55SX, work fine if this is removed.  */
-
-		irq = inb_p( 0x61 );	/* read the current state */
-		outb_p( irq|0x80, 0x61 );	/* reset the IRQ */
-	}
+    if( MCA_bus ) {
+        /* The PS/2 uses level-triggered interrupts.  You can't
+        turn them off, nor would you want to (any attempt to
+        enable edge-triggered interrupts usually gets intercepted by a
+        special hardware circuit).  Hence we have to acknowledge
+        the timer interrupt.  Through some incredibly stupid
+        design idea, the reset for IRQ 0 is done by setting the
+        high bit of the PPI port B (0x61).  Note that some PS/2s,
+        notably the 55SX, work fine if this is removed.  */
+        // 读取0x61端口当前值（PS/2 PPI port B）
+        irq = inb_p( 0x61 );
+        // 置最高bit，复位IRQ0电平中断
+        outb_p( irq|0x80, 0x61 );
+    }
 #endif
 }
 
@@ -456,52 +476,65 @@ static int use_tsc;
  * Time Stamp Counter value at the time of the timer interrupt, so that
  * we later on can estimate the time of day more exactly.
  */
+/**
+ * timer_interrupt - IRQ0(PIT定时器)中断上半部处理函数
+ * @irq: 中断号，固定为0
+ * @dev_id: 设备私有数据，此处为NULL
+ * @regs: 中断发生时的寄存器现场
+ *
+ * 功能：系统节拍定时器中断上半部；带SA_INTERRUPT，运行时关闭本地BH；
+ *       如果开启TSC，读取TSC+锁存PIT计数值，校正时间偏移；
+ *       调用do_timer_interrupt完成核心节拍更新、jiffies递增、软定时器唤起
+ * 约束：硬中断上下文，不可睡眠；持有xtime_lock保护xtime全局时间
+ * 上下文：硬中断上下文，SA_INTERRUPT，BH被屏蔽
+ */
 static void timer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
-	int count;
+    int count;
+    /*
+     * Here we are in the timer irq handler. We just have irqs locally
+     * disabled but we don't know if the timer_bh is running on the other
+     * CPU. We need to avoid to SMP race with it. NOTE: we don' t need
+     * the irq version of write_lock because as just said we have irq
+     * locally disabled. -arca
+     */
+    // 获取xtime写锁，保护xtime全局墙上时间，防止和其他CPU上timer_bh产生SMP竞争
+    write_lock(&xtime_lock);
+    if (use_tsc)
+    {
+        /*
+         * It is important that these two operations happen almost at
+         * the same time. We do the RDTSC stuff first, since it's
+         * faster. To avoid any inconsistencies, we need interrupts
+         * disabled locally.
+         */
+        /*
+         * Interrupts are just disabled locally since the timer irq
+         * has the SA_INTERRUPT flag set. -arca
+         */
 
-	/*
-	 * Here we are in the timer irq handler. We just have irqs locally
-	 * disabled but we don't know if the timer_bh is running on the other
-	 * CPU. We need to avoid to SMP race with it. NOTE: we don' t need
-	 * the irq version of write_lock because as just said we have irq
-	 * locally disabled. -arca
-	 */
-	write_lock(&xtime_lock);
+        // 读取Pentium TSC时间戳计数器低32位，保存到last_tsc_low
+        rdtscl(last_tsc_low);
+        // 获取i8253 PIT端口访问自旋锁，保护对0x40/0x43硬件端口的并发访问
+        spin_lock(&i8253_lock);
+        // 向PIT控制端口0x43写入0x00，锁存当前通道0计数器值
+        outb_p(0x00, 0x43);
+        // 先读低字节锁存值
+        count = inb_p(0x40);
+        // 再读高字节，拼接成16位计数值
+        count |= inb(0x40) << 8;
+        // 释放PIT端口锁
+        spin_unlock(&i8253_lock);
+        // 换算PIT已经走过的tick时间
+        count = ((LATCH-1) - count) * TICK_SIZE;
+        // 计算本次中断实际发生相对节拍起点的偏移，用于gettimeofday精细校正
+        delay_at_last_interrupt = (count + LATCH/2) / LATCH;
+    }
 
-	if (use_tsc)
-	{
-		/*
-		 * It is important that these two operations happen almost at
-		 * the same time. We do the RDTSC stuff first, since it's
-		 * faster. To avoid any inconsistencies, we need interrupts
-		 * disabled locally.
-		 */
-
-		/*
-		 * Interrupts are just disabled locally since the timer irq
-		 * has the SA_INTERRUPT flag set. -arca
-		 */
-	
-		/* read Pentium cycle counter */
-
-		rdtscl(last_tsc_low);
-
-		spin_lock(&i8253_lock);
-		outb_p(0x00, 0x43);     /* latch the count ASAP */
-
-		count = inb_p(0x40);    /* read the latched count */
-		count |= inb(0x40) << 8;
-		spin_unlock(&i8253_lock);
-
-		count = ((LATCH-1) - count) * TICK_SIZE;
-		delay_at_last_interrupt = (count + LATCH/2) / LATCH;
-	}
- 
-	do_timer_interrupt(irq, NULL, regs);
-
-	write_unlock(&xtime_lock);
-
+    // 定时器中断核心逻辑：jiffies++、更新xtime、唤起timer_bh（定时器下半部）
+    do_timer_interrupt(irq, NULL, regs);
+    // 释放xtime写锁
+    write_unlock(&xtime_lock);
 }
 
 /* not static: needed by APM */
@@ -544,6 +577,13 @@ unsigned long get_cmos_time(void)
 	return mktime(year, mon, day, hour, min, sec);
 }
 
+/**
+ * irq0 - PIT定时器中断（IRQ0）对应的irqaction实例
+ *
+ * 功能：描述系统节拍定时器中断的处理信息，注册到IRQ0中断描述符
+ * 约束：SA_INTERRUPT标志，代表该中断上半部执行时关闭本地软中断(BH)
+ * 上下文：time_init中通过setup_irq完成注册，硬件定时器中断触发时执行timer_interrupt
+ */
 static struct irqaction irq0  = { timer_interrupt, SA_INTERRUPT, 0, "timer", NULL, NULL};
 
 /* ------ Calibrate the TSC ------- 
@@ -623,13 +663,21 @@ bad_ctc:
 	return 0;
 }
 
+/**
+ * time_init - 内核时间子系统初始化函数，start_kernel 阶段调用
+ *
+ * 功能：读取CMOS RTC获取初始墙上时间，检测并标定TSC时间戳计数器，注册系统定时器中断IRQ0
+ * 约束：内核启动早期调用，中断此时尚未正式调度；属于架构相关初始化
+ * 上下文：内核启动上下文，start_kernel中执行
+ */
 void __init time_init(void)
 {
-	extern int x86_udelay_tsc;
-	
-	xtime.tv_sec = get_cmos_time();
-	xtime.tv_usec = 0;
+    extern int x86_udelay_tsc;
 
+    // 从CMOS RTC硬件读取当前墙上时间，赋值给xtime（内核全局墙上时间）
+    xtime.tv_sec = get_cmos_time();
+    // 微秒初始化为0
+    xtime.tv_usec = 0;
 /*
  * If we have APM enabled or the CPU clock speed is variable
  * (CPU stops clock on HLT or slows clock to save power)
@@ -644,63 +692,68 @@ void __init time_init(void)
  * to disk; this won't break the kernel, though, 'cuz we're
  * smart.  See arch/i386/kernel/apm.c.
  */
- 	/*
- 	 *	Firstly we have to do a CPU check for chips with
- 	 * 	a potentially buggy TSC. At this point we haven't run
- 	 *	the ident/bugs checks so we must run this hook as it
- 	 *	may turn off the TSC flag.
- 	 *
- 	 *	NOTE: this doesnt yet handle SMP 486 machines where only
- 	 *	some CPU's have a TSC. Thats never worked and nobody has
- 	 *	moaned if you have the only one in the world - you fix it!
- 	 */
- 
- 	dodgy_tsc();
- 	
-	if (cpu_has_tsc) {
-		unsigned long tsc_quotient = calibrate_tsc();
-		if (tsc_quotient) {
-			fast_gettimeoffset_quotient = tsc_quotient;
-			use_tsc = 1;
-			/*
-			 *	We could be more selective here I suspect
-			 *	and just enable this for the next intel chips ?
-			 */
-			x86_udelay_tsc = 1;
+    /*
+     *  Firstly we have to do a CPU check for chips with
+     *  a potentially buggy TSC. At this point we haven't run
+     *  the ident/bugs checks so we must run this hook as it
+     *  may turn off the TSC flag.
+     *
+     *  NOTE: this doesnt yet handle SMP 486 machines where only
+     *  some CPU's have a TSC. Thats never worked and nobody has
+     *  moaned if you have the only one in the world - you fix it!
+     */
+
+    // 检测存在bug的TSC，有问题则清除TSC可用标记cpu_has_tsc
+    dodgy_tsc();
+
+    // 如果CPU支持TSC时间戳计数器
+    if (cpu_has_tsc) {
+        // 标定TSC，计算每个微秒对应的TSC计数
+        unsigned long tsc_quotient = calibrate_tsc();
+        if (tsc_quotient) {
+            // 保存TSC标定系数，用于快速计算时间偏移
+            fast_gettimeoffset_quotient = tsc_quotient;
+            // 标记开启TSC快速时间获取
+            use_tsc = 1;
+            /*
+             *  We could be more selective here I suspect
+             *  and just enable this for the next intel chips ?
+             */
+            // 标记udelay延时函数使用TSC实现
+            x86_udelay_tsc = 1;
 #ifndef do_gettimeoffset
-			do_gettimeoffset = do_fast_gettimeoffset;
+            // 把获取时间偏移的函数指针替换为TSC快速版本
+            do_gettimeoffset = do_fast_gettimeoffset;
 #endif
-			do_get_fast_time = do_gettimeofday;
-
-			/* report CPU clock rate in Hz.
-			 * The formula is (10^6 * 2^32) / (2^32 * 1 / (clocks/us)) =
-			 * clock/second. Our precision is about 100 ppm.
-			 */
-			{	unsigned long eax=0, edx=1000;
-				__asm__("divl %2"
-		       		:"=a" (cpu_khz), "=d" (edx)
-        	       		:"r" (tsc_quotient),
-	                	"0" (eax), "1" (edx));
-				printk("Detected %lu.%03lu MHz processor.\n", cpu_khz / 1000, cpu_khz % 1000);
-			}
-		}
-	}
-
+            // 配置快速gettimeofday接口
+            do_get_fast_time = do_gettimeofday;
+            /* report CPU clock rate in Hz.
+             * The formula is (10^6 * 2^32) / (2^32 * 1 / (clocks/us)) =
+             * clock/second. Our precision is about 100 ppm.
+             */
+            {   unsigned long eax=0, edx=1000;
+                // 汇编除法，根据tsc_quotient算出cpu_khz（CPU千赫兹频率）
+                __asm__("divl %2"
+                        :"=a" (cpu_khz), "=d" (edx)
+                        :"r" (tsc_quotient),
+                        "0" (eax), "1" (edx));
+                // 打印检测到的CPU主频
+                printk("Detected %lu.%03lu MHz processor.\n", cpu_khz / 1000, cpu_khz % 1000);
+            }
+        }
+    }
 #ifdef CONFIG_VISWS
-	printk("Starting Cobalt Timer system clock\n");
-
-	/* Set the countdown value */
-	co_cpu_write(CO_CPU_TIMEVAL, CO_TIME_HZ/HZ);
-
-	/* Start the timer */
-	co_cpu_write(CO_CPU_CTRL, co_cpu_read(CO_CPU_CTRL) | CO_CTRL_TIMERUN);
-
-	/* Enable (unmask) the timer interrupt */
-	co_cpu_write(CO_CPU_CTRL, co_cpu_read(CO_CPU_CTRL) & ~CO_CTRL_TIMEMASK);
-
-	/* Wire cpu IDT entry to s/w handler (and Cobalt APIC to IDT) */
-	setup_irq(CO_IRQ_TIMER, &irq0);
+    printk("Starting Cobalt Timer system clock\n");
+    // 设置定时器倒计时初值
+    co_cpu_write(CO_CPU_TIMEVAL, CO_TIME_HZ/HZ);
+    // 启动Cobalt硬件定时器
+    co_cpu_write(CO_CPU_CTRL, co_cpu_read(CO_CPU_CTRL) | CO_CTRL_TIMERUN);
+    // 解除定时器中断屏蔽，允许定时器中断上报
+    co_cpu_write(CO_CPU_CTRL, co_cpu_read(CO_CPU_CTRL) & ~CO_CTRL_TIMEMASK);
+    // 注册Cobalt平台定时器中断
+    setup_irq(CO_IRQ_TIMER, &irq0);
 #else
-	setup_irq(0, &irq0);
+    // 普通x86平台：注册PIT定时器IRQ0，绑定irq0中断描述块
+    setup_irq(0, &irq0);
 #endif
 }
